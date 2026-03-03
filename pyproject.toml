@@ -5,13 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "prism"
 version = "0.1.0"
-description = "PRISM: Self-Evolving Skill Library combining GEPA and ACE"
+description = "PRISM: Self-Evolving Skill Library for LLM Systems"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
 embedding = ["numpy>=1.24.0", "sentence-transformers>=2.2.0"]
-gepa = ["gepa"]
 dev = ["pytest>=7.0", "ruff>=0.1.0", "pyright>=1.1.0"]
 
 [tool.setuptools.packages.find]

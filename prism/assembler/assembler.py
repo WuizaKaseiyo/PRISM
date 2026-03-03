@@ -80,12 +80,20 @@ class SkillAssembler:
                 logger.warning("Embedding failed, skipping Layer 2: %s", e)
 
         # Layer 3: TaskTypeIndex lookup (merge by score)
-        task_text = json.dumps(task) if isinstance(task, dict) else str(task)
-        task_type = self.task_index.classify(task_text)
+        task_text = task.get("question", json.dumps(task)) if isinstance(task, dict) else str(task)
+        task_type = self.task_index.classify_task(task)
         top_indexed = self.task_index.top_skills(task_type, n=len(candidates))
         for skill_id, ema_score in top_indexed:
             if skill_id in scored:
                 scored[skill_id] = max(scored[skill_id], ema_score)
+
+        # Exploration bonus: give unevaluated skills a chance to be tried
+        # Score = 0.5 (midpoint) so they rank above untried indexed skills
+        # but below proven ones.  Decays once the skill accumulates evals.
+        EXPLORE_BONUS = 0.5
+        for skill in candidates:
+            if skill.total_evals == 0 and scored[skill.skill_id] == 0.0:
+                scored[skill.skill_id] = EXPLORE_BONUS
 
         # Sort by score descending
         ranked = sorted(scored.items(), key=lambda x: x[1], reverse=True)
@@ -134,10 +142,10 @@ class SkillAssembler:
         if not selected_skills:
             return "", []
 
-        # Build context string
+        # Build context string (full markdown body per skill)
         context_parts = []
         for skill in selected_skills:
-            context_parts.append(f"[Skill: {skill.name}]\n{skill.content}")
+            context_parts.append(f"## Skill: {skill.name}\n\n{skill.content}")
         skill_context = "\n\n".join(context_parts)
         skill_ids = [s.skill_id for s in selected_skills]
 

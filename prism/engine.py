@@ -98,7 +98,7 @@ class PRISMEngine:
         )
 
         # Step 4: CURATE
-        task_type = self.task_index.classify(str(task))
+        task_type = self.task_index.classify_task(task)
         ops = self.curator.curate(
             reflection=reflection,
             module_tag=module_tag,

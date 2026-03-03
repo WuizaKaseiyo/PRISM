@@ -31,6 +31,7 @@ class TaskTypeIndex:
             self._load()
 
     def classify(self, text: str) -> str:
+        """Classify a plain text string by keyword matching."""
         text_lower = text.lower()
         best_type = "general"
         best_count = 0
@@ -40,6 +41,22 @@ class TaskTypeIndex:
                 best_count = count
                 best_type = task_type
         return best_type
+
+    def classify_task(self, task: dict) -> str:
+        """Classify a task dict — uses explicit type field if present,
+        otherwise classifies on question text to avoid dict-key pollution."""
+        # 1. Explicit type field (most reliable)
+        explicit = task.get("type", "")
+        if explicit and explicit in self._keyword_map:
+            return explicit
+
+        # 2. Keyword classify on question text only (not the whole dict)
+        question = task.get("question", "")
+        if question:
+            return self.classify(question)
+
+        # 3. Fallback: classify full dict repr
+        return self.classify(str(task))
 
     def update(self, task_type: str, skill_id: str, score: float) -> None:
         if task_type not in self._index:

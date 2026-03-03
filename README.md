@@ -1,6 +1,6 @@
 # PRISM — Self-Evolving Skill Library
 
-PRISM combines [GEPA](https://github.com/gepa-ai/gepa)'s Pareto evolutionary search with [ACE](https://github.com/ace-project/ace)'s incremental knowledge curation into a persistent, self-evolving skill library for LLM systems.
+A persistent, self-evolving skill library for LLM systems.
 
 **Core idea**: Every time an LLM solves a task, PRISM reflects on what worked, what didn't, and what knowledge was missing — then automatically creates, refines, splits, merges, or retires reusable "skills" that improve future performance.
 
@@ -22,7 +22,7 @@ task ──→ ① RETRIEVE   4-layer skill retrieval (filter → embedding → 
 | Operation | Trigger | What Happens |
 |-----------|---------|-------------|
 | **BIRTH** | Knowledge gap found, no matching skill | LLM creates a new skill |
-| **ENRICH** | Gap matches existing skill | Append strategy note (no rewrite) |
+| **ENRICH** | Gap matches existing skill | Append strategy content (no rewrite) |
 | **SPECIALIZE** | Skill has high score variance (>0.20) after 5+ evals | LLM splits into 2 focused children |
 | **GENERALIZE** | Two skills share ≥60% keyword overlap (Jaccard) | Merge into one combined skill |
 | **RETIRE** | harmful - helpful > 3 | Deactivate the skill |
@@ -54,34 +54,18 @@ OPENROUTER_MODEL="google/gemini-2.5-flash-preview"
 python examples/run_prism.py
 ```
 
-Expected output:
+### 4. AIME 2025 Benchmark
 
-```
-PRISM Demo — OpenRouter LLM (fully real)
-Model: google/gemini-2.5-flash-preview
+```bash
+pip install pandas pyarrow
 
-Seeded skill: Basic Arithmetic (e84095c3fc17)
-
-=== Epoch 1/2 ===
-[Step 1] RETRIEVE: 1 skills assembled
-[Step 1] EXECUTE: score=1.000
-[Step 1] REFLECT: 1 attributions, 4 gaps
-[Curator] ENRICH: e84095c3fc17 with note: When solving arithmetic problems...
-[Step 1] CURATE: ['ENRICH']
-...
-[Curator] BIRTH: Response Formatting and Precision (b60e12c421aa)
-...
-[Curator] SPECIALIZE: e84095c3fc17 → ['cb830e375cf5', 'ec3169c06c4b']
-...
-
-Final Library Summary
-  Total skills: 10
-  Lifecycle operations triggered: ['BIRTH', 'ENRICH', 'SPECIALIZE']
+python -m evaluate.aime2025                        # all 30 problems
+python -m evaluate.aime2025 --problems 7           # single problem
+python -m evaluate.aime2025 --problems 1-5,20,25   # mix ranges and singles
+python -m evaluate.aime2025 --eval-only            # eval existing skills (no training)
 ```
 
 ## Usage
-
-### Standalone
 
 ```python
 from prism import PRISMEngine, Skill
@@ -102,15 +86,15 @@ engine = PRISMEngine(
     base_prompt="You are a helpful assistant.",
     top_k=5,
     token_budget=2000,
-    library_path="skills.json",    # persistence
-    index_path="task_index.json",  # persistence
+    library_path="data/skills",
+    index_path="data/task_index.json",
 )
 
 # Optional: seed a skill
 engine.library.add(Skill(
     name="My First Skill",
-    description="...",
-    content="...",
+    description="Use when the task involves...",
+    content="# My First Skill\n\n## Overview\n...\n\n## Workflow\n1. ...",
     module_tag="general",
     keywords=["..."],
     task_types=["qa"],
@@ -118,67 +102,13 @@ engine.library.add(Skill(
 
 # Train
 result = engine.train(
-    trainset=[{"question": "...", "answer": "..."}],
+    trainset=[{"question": "...", "answer": "...", "type": "math"}],
     num_epochs=3,
     module_tag="general",
 )
 
 # Single step
 result = engine.step({"question": "..."}, module_tag="general")
-```
-
-### With GEPA
-
-PRISM wraps any `GEPAAdapter` transparently — GEPA doesn't know PRISM exists:
-
-```python
-from prism import SkillLibrary
-from prism.task_index import TaskTypeIndex
-from prism.gepa_integration import PRISMWrappedAdapter
-import gepa
-
-inner_adapter = YourGEPAAdapter(...)
-library = SkillLibrary(path="skills.json")
-task_index = TaskTypeIndex(path="index.json")
-
-wrapped = PRISMWrappedAdapter(
-    inner_adapter=inner_adapter,
-    library=library,
-    task_index=task_index,
-    llm_fn=my_llm,
-    module_tag="Generator",
-)
-
-result = gepa.optimize(
-    seed_candidate={"instructions": "..."},
-    trainset=data,
-    adapter=wrapped,
-    reflection_lm="openai/gpt-4o",
-)
-```
-
-### With ACE
-
-PRISM replaces ACE's 3-agent system (Generator + Reflector + Curator):
-
-```python
-from prism import SkillLibrary
-from prism.task_index import TaskTypeIndex
-from prism.ace_integration import PRISMACEBridge
-
-library = SkillLibrary(path="skills.json")
-task_index = TaskTypeIndex(path="index.json")
-bridge = PRISMACEBridge(library, task_index, llm_fn=my_llm)
-
-# Import existing ACE playbook
-bridge.import_from_ace_playbook(open("playbook.txt").read())
-
-# Use in place of ACE agents
-result = bridge.generate(base_prompt, task)
-bridge.reflect_and_curate(task, result, trace, ground_truth)
-
-# Export back to ACE format
-bridge.export_to_ace_playbook("updated_playbook.txt")
 ```
 
 ## Architecture
@@ -190,24 +120,32 @@ prism/
 │   ├── engine.py                # 6-step loop + training orchestrator
 │   ├── utils.py                 # Shared JSON extraction (3-strategy fallback)
 │   ├── skill_library/
-│   │   ├── skill.py             # Skill dataclass (20 fields)
-│   │   └── library.py           # In-memory store + JSON persistence
+│   │   ├── skill.py             # Skill dataclass + Claude Code SKILL.md serialization
+│   │   └── library.py           # Directory-per-skill storage + _meta.json persistence
 │   ├── task_index/
 │   │   └── index.py             # task_type → skill_id → EMA score
 │   ├── assembler/
 │   │   └── assembler.py         # 4-layer retrieval (filter→cosine→EMA→LLM)
-│   ├── lifecycle/
-│   │   ├── reflector.py         # LLM-based trace analysis → attributions + gaps
-│   │   └── curator.py           # 5 operations: BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE
-│   ├── gepa_integration/
-│   │   └── adapter.py           # Wraps GEPAAdapter, injects skills into evaluate()
-│   └── ace_integration/
-│       └── bridge.py            # Replaces ACE Generator+Reflector+Curator
+│   └── lifecycle/
+│       ├── reflector.py         # LLM-based trace analysis → attributions + gaps
+│       └── curator.py           # 5 operations: BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE
+├── evaluate/
+│   └── aime2025/                # AIME 2025 benchmark (30 competition math problems)
 ├── examples/
 │   └── run_prism.py             # Full demo with OpenRouter
 ├── pyproject.toml
-├── requirements.txt
 └── .env                         # OPENROUTER_API_KEY, MODEL, BASE_URL
+```
+
+### Skill Storage (Claude Code format)
+
+```
+data/skills/
+├── basic-arithmetic/
+│   └── SKILL.md                 # name + description frontmatter, rich markdown body
+├── exact-format-matching/
+│   └── SKILL.md
+└── _meta.json                   # All PRISM tracking data keyed by skill_id
 ```
 
 ### Dependency Layers
@@ -218,7 +156,6 @@ L1  SkillLibrary, TaskTypeIndex   ← uses L0
 L2  SkillAssembler, PRISMReflector ← uses L0-L1
 L3  SkillCurator                  ← uses L0-L2
 L4  PRISMEngine                   ← uses L0-L3
-L5  PRISMWrappedAdapter, PRISMACEBridge ← uses L0-L3
 ```
 
 ## Key Interfaces
@@ -262,17 +199,19 @@ Edit constants in `prism/lifecycle/curator.py`:
 | `SPECIALIZE_VARIANCE` | 0.20 | Lower = split skills more aggressively |
 | `MIN_EVALS_FOR_LIFECYCLE` | 5 | Minimum evaluations before SPECIALIZE triggers |
 | `MERGE_KEYWORD_OVERLAP` | 0.60 | Lower = merge skills more aggressively |
+| `MAX_SKILL_CONTENT_CHARS` | 8000 | Cap on skill content length (~2000 tokens) |
 
 ## Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
 | Zero required dependencies | numpy/sentence-transformers optional; pure Python cosine fallback |
-| JSON persistence | Simple, debuggable, git-friendly. Adequate for <1000 skills |
+| Directory-per-skill storage | Claude Code compatible SKILL.md + centralized _meta.json for tracking |
 | 3-strategy JSON extraction | LLM output unreliable: direct parse → code block → brace counting |
 | EMA scoring (alpha=0.3) | Remembers history while responding quickly to changes |
 | Differential eval is optional | Avoids doubling API cost when not needed |
 | Skills have parent/children | Tracks lineage through SPECIALIZE operations |
+| Exploration bonus for new skills | Prevents cold-start dead loop for newly created skills |
 | Graceful degradation everywhere | No embed_fn → skip Layer 2. LLM parse failure → log warning, continue |
 
 ## Dependencies
@@ -286,7 +225,7 @@ Edit constants in `prism/lifecycle/curator.py`:
 | `openai` | OpenRouter / OpenAI API calls |
 | `numpy` | Faster cosine similarity |
 | `sentence-transformers` | Layer 2 embedding retrieval |
-| `gepa` | GEPA integration |
+| `pandas`, `pyarrow` | AIME 2025 benchmark dataset |
 | `pytest`, `ruff`, `pyright` | Development |
 
 Install optional groups:

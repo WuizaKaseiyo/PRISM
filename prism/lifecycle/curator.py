@@ -16,6 +16,7 @@ RETIRE_GAP = 3
 SPECIALIZE_VARIANCE = 0.20
 MIN_EVALS_FOR_LIFECYCLE = 5
 MERGE_KEYWORD_OVERLAP = 0.60
+MAX_SKILL_CONTENT_CHARS = 8000  # ~2000 tokens; cap ENRICH growth
 
 
 BIRTH_OR_ENRICH_PROMPT = """Given these knowledge gaps and existing active skills, decide whether to CREATE a new skill or ENRICH an existing one.
@@ -26,17 +27,30 @@ Gaps identified:
 Active skills:
 {active_skills}
 
-If a gap closely matches an existing skill, return ENRICH with a strategy note to add.
+If a gap closely matches an existing skill, return ENRICH with additional content to append.
 If the gap represents genuinely new knowledge, return CREATE with full skill details.
+
+For CREATE, generate a skill in Claude Code format:
+- "name": human-readable skill name (e.g. "Exact Format Matching")
+- "description": trigger condition starting with "Use when..." — be specific and pushy
+- "content": a FULL markdown document (50-200 lines) with:
+  - `# Title` heading
+  - `## Overview` section explaining what this skill does
+  - `## Workflow` section with numbered steps
+  - `## Examples` or `## Key Principles` sections as appropriate
+  - Code examples in fenced blocks where applicable
+  Do NOT write a one-liner. Write substantial operational instructions.
+
+For ENRICH, provide a markdown section to append (with ## heading and content).
 
 Return ONLY a JSON object:
 {{
   "action": "CREATE" or "ENRICH",
   "skill_id": "existing skill ID (only for ENRICH)",
   "name": "skill name (only for CREATE)",
-  "description": "skill description (only for CREATE)",
-  "content": "skill content (only for CREATE)",
-  "strategy_note": "note to add (only for ENRICH)",
+  "description": "Use when... trigger condition (only for CREATE)",
+  "content": "full markdown body with # headings (only for CREATE)",
+  "enrich_content": "## Section Heading\\nmarkdown content to append (only for ENRICH)",
   "keywords": ["keyword1", "keyword2"],
   "task_types": ["type1"]
 }}"""
@@ -51,20 +65,30 @@ Eval scores: {scores}
 
 Split this into 2 more specialized skills. Each child should handle a specific subset of use cases.
 
+Each child must be a FULL Claude Code format skill:
+- "name": human-readable skill name (e.g. "Linear Equation Solving")
+- "description": trigger condition starting with "Use when..." — be specific about when this child applies
+- "content": a FULL markdown document (50-200 lines) with:
+  - `# Title` heading
+  - `## Overview` section
+  - `## Workflow` section with numbered steps
+  - `## Examples` or `## Key Principles` sections as appropriate
+  Do NOT write a one-liner. Write substantial operational instructions.
+
 Return ONLY a JSON object:
 {{
   "children": [
     {{
-      "name": "specialized name 1",
-      "description": "when to use child 1",
-      "content": "specialized content 1",
+      "name": "Specialized Name 1",
+      "description": "Use when the task involves...",
+      "content": "# Specialized Name 1\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n2. ...",
       "keywords": ["kw1"],
       "task_types": ["type1"]
     }},
     {{
-      "name": "specialized name 2",
-      "description": "when to use child 2",
-      "content": "specialized content 2",
+      "name": "Specialized Name 2",
+      "description": "Use when the task involves...",
+      "content": "# Specialized Name 2\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n2. ...",
       "keywords": ["kw1"],
       "task_types": ["type1"]
     }}
@@ -149,12 +173,38 @@ class SkillCurator:
         logger.info("[Curator] BIRTH: %s (%s)", skill.name, skill.skill_id)
         return skill
 
-    def _enrich(self, skill_id: str, strategy_note: str) -> bool:
+    def _enrich(self, skill_id: str, enrich_content: str) -> bool:
         skill = self.library.get(skill_id)
         if skill is None:
             return False
-        skill.strategy_notes.append(strategy_note)
-        logger.info("[Curator] ENRICH: %s with note: %s", skill.skill_id, strategy_note[:50])
+        if not enrich_content.strip():
+            return False
+
+        new_section = enrich_content.strip()
+        proposed = skill.content.rstrip() + "\n\n" + new_section + "\n"
+
+        if len(proposed) <= MAX_SKILL_CONTENT_CHARS:
+            # Fits within budget — append normally
+            skill.content = proposed
+        else:
+            # Over budget — drop the oldest enrichment section to make room.
+            # Enrichment sections are ## headings added after the original body.
+            # Find all ## sections, keep the core (everything up to the first
+            # enrichment), drop the oldest enrichment, then append the new one.
+            import re
+            # Split on ## headings (keep delimiters)
+            parts = re.split(r"(?=\n## )", skill.content)
+            if len(parts) > 2:
+                # Drop the second part (first enrichment) to make room
+                parts.pop(1)
+            trimmed = "".join(parts).rstrip()
+            skill.content = trimmed + "\n\n" + new_section + "\n"
+
+            # If still over budget (new section itself is huge), hard-truncate
+            if len(skill.content) > MAX_SKILL_CONTENT_CHARS:
+                skill.content = skill.content[:MAX_SKILL_CONTENT_CHARS].rstrip() + "\n"
+
+        logger.info("[Curator] ENRICH: %s with content: %s", skill.skill_id, enrich_content[:50])
         return True
 
     def _birth_or_enrich(
@@ -183,9 +233,9 @@ class SkillCurator:
             action = parsed.get("action", "CREATE")
             if action == "ENRICH":
                 skill_id = parsed.get("skill_id", "")
-                note = parsed.get("strategy_note", "")
-                if skill_id and note:
-                    self._enrich(skill_id, note)
+                enrich_content = parsed.get("enrich_content", parsed.get("strategy_note", ""))
+                if skill_id and enrich_content:
+                    self._enrich(skill_id, enrich_content)
                     return "ENRICH"
             else:
                 name = parsed.get("name", "Unnamed Skill")

@@ -9,7 +9,7 @@ from typing import Any
 def extract_json_from_text(text: str) -> dict[str, Any] | None:
     """Extract JSON object from text using multiple strategies.
 
-    Mirrors ACE's extract_json_from_text with 3-strategy fallback:
+    3-strategy fallback:
     1. Direct JSON.parse of entire text
     2. ```json code block extraction
     3. Balanced brace counting for embedded JSON

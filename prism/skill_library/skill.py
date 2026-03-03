@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +30,13 @@ class Skill:
     embedding: list[float] | None = None
 
     @property
+    def slug(self) -> str:
+        """Kebab-case directory name derived from skill name."""
+        s = self.name.lower()
+        s = re.sub(r"[^a-z0-9]+", "-", s)
+        return s.strip("-")
+
+    @property
     def score_variance(self) -> float:
         if len(self.eval_scores) < 2:
             return 0.0
@@ -42,6 +50,64 @@ class Skill:
     @property
     def total_evals(self) -> int:
         return self.helpful_count + self.harmful_count + self.neutral_count
+
+    # --- Markdown serialization (Claude Code SKILL.md format) ---
+
+    def to_markdown(self) -> str:
+        """Serialize to Claude Code SKILL.md format.
+
+        Only name + description go in YAML frontmatter.
+        All operational content goes in the markdown body.
+        Internal tracking fields are stored separately in _meta.json.
+        """
+        lines = ["---"]
+        lines.append(f"name: {self.slug}")
+        lines.append(f"description: {_yaml_escape(self.description)}")
+        lines.append("---")
+        lines.append("")
+        lines.append(self.content)
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def from_markdown(cls, text: str) -> Skill:
+        """Parse a Claude Code SKILL.md file.
+
+        Expects only name + description in frontmatter.
+        Everything below the closing --- is the content body.
+        """
+        match = re.match(r"^---\n(.*?)\n---\n?(.*)", text, re.DOTALL)
+        if not match:
+            raise ValueError("Invalid skill markdown: missing YAML frontmatter")
+
+        frontmatter_text = match.group(1)
+        body = match.group(2).strip()
+
+        # Parse YAML frontmatter (simple key: value parser)
+        meta: dict[str, Any] = {}
+        for line in frontmatter_text.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            elif value.startswith("'") and value.endswith("'"):
+                value = value[1:-1]
+            meta[key] = value
+
+        # Derive display name from slug: "basic-arithmetic" → "Basic Arithmetic"
+        slug = meta.get("name", "unnamed")
+        display_name = slug.replace("-", " ").title()
+
+        return cls(
+            name=display_name,
+            description=meta.get("description", ""),
+            content=body,
+        )
+
+    # --- Dict serialization (kept for backward compat / index metadata) ---
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,3 +155,10 @@ class Skill:
             keywords=data.get("keywords", []),
             embedding=data.get("embedding"),
         )
+
+
+def _yaml_escape(s: str) -> str:
+    """Escape a string for YAML value if it contains special characters."""
+    if any(c in s for c in ":#{}[]|>&*!?,"):
+        return f'"{s}"'
+    return s

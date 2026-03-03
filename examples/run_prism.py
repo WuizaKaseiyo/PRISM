@@ -111,6 +111,10 @@ def main():
     print(f"Model: {MODEL}")
     print()
 
+    # Persistent storage
+    data_dir = Path(__file__).resolve().parent.parent / "data"
+    data_dir.mkdir(exist_ok=True)
+
     # Create engine
     engine = PRISMEngine(
         evaluate_fn=evaluate_fn,
@@ -121,14 +125,56 @@ def main():
         token_budget=2000,
         maintenance_interval=5,
         enable_differential_eval=True,
+        library_path=str(data_dir / "skills"),
+        index_path=str(data_dir / "task_index.json"),
     )
 
-    # Seed one skill
+    # Clean up old flat-file data if present
+    old_skills_dir = data_dir / "skills"
+    if old_skills_dir.exists():
+        # Remove legacy flat .md files (not subdirectories)
+        for f in old_skills_dir.glob("*.md"):
+            f.unlink()
+
+    # Seed one skill (Claude Code format: rich markdown body with sections)
     seed_skill = Skill(
         name="Basic Arithmetic",
-        description="Solve basic arithmetic problems using standard operations",
-        content="To solve arithmetic: identify the operation (add, subtract, multiply, divide), "
-                "apply the operation step by step, verify by reverse calculation.",
+        description="Use when the task involves basic arithmetic operations such as addition, subtraction, multiplication, or division of numbers.",
+        content=(
+            "# Basic Arithmetic\n"
+            "\n"
+            "## Overview\n"
+            "Strategy for solving arithmetic problems by identifying the operation,\n"
+            "applying it step by step, and verifying the result.\n"
+            "\n"
+            "## Workflow\n"
+            "1. **Read the problem** — identify the numbers and the operation(s) required\n"
+            "2. **Plan the steps** — break compound expressions into single operations\n"
+            "3. **Execute each step** — perform the operation, showing intermediate results\n"
+            "4. **Verify** — use the inverse operation or estimation to confirm the answer\n"
+            "\n"
+            "## Key Principles\n"
+            "- Follow order of operations (PEMDAS/BODMAS) for compound expressions\n"
+            "- Show work for each intermediate step so errors are easy to spot\n"
+            "- For division, check by multiplying the quotient by the divisor\n"
+            "- For subtraction, check by adding the difference to the subtrahend\n"
+            "\n"
+            "## Examples\n"
+            "\n"
+            "### Addition\n"
+            "```\n"
+            "15 + 27 = 42\n"
+            "Check: 42 - 27 = 15 ✓\n"
+            "```\n"
+            "\n"
+            "### Multi-step\n"
+            "```\n"
+            "3 × (4 + 5) − 2\n"
+            "  = 3 × 9 − 2\n"
+            "  = 27 − 2\n"
+            "  = 25\n"
+            "```"
+        ),
         module_tag="general",
         keywords=["arithmetic", "add", "subtract", "multiply", "divide", "calculate"],
         task_types=["math"],
@@ -139,11 +185,11 @@ def main():
 
     # Training tasks
     trainset = [
-        {"question": "What is 15 + 27?", "answer": "42", "type": "easy arithmetic"},
-        {"question": "Solve: 3x + 7 = 22", "answer": "x=5", "type": "algebra"},
-        {"question": "Calculate the area of a triangle with base 10 and height 6", "answer": "30", "type": "geometry"},
-        {"question": "Hard: Find the derivative of x^3 + 2x^2 - 5x + 3", "answer": "3x^2 + 4x - 5", "type": "hard calculus"},
-        {"question": "What is 144 / 12?", "answer": "12", "type": "easy arithmetic"},
+        {"question": "What is 15 + 27?", "answer": "42", "type": "math"},
+        {"question": "Solve: 3x + 7 = 22", "answer": "x=5", "type": "math"},
+        {"question": "Calculate the area of a triangle with base 10 and height 6", "answer": "30", "type": "math"},
+        {"question": "Hard: Find the derivative of x^3 + 2x^2 - 5x + 3", "answer": "3x^2 + 4x - 5", "type": "math"},
+        {"question": "What is 144 / 12?", "answer": "12", "type": "math"},
     ]
 
     print("=" * 60)
