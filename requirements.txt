@@ -1,0 +1,3 @@
+# Optional dependencies — PRISM has no required dependencies
+numpy>=1.24.0          # optional, for embedding math
+sentence-transformers>=2.2.0  # optional, for Layer 2 semantic retrieval
