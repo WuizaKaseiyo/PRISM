@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,13 @@ class Skill:
     task_types: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     embedding: list[float] | None = None
+    score_matrix: dict[str, float] = field(default_factory=dict)
+    pareto_frequency: float = 0.0
+
+    @staticmethod
+    def task_key(question: str) -> str:
+        """8-char md5 hash of question text for per-instance score tracking."""
+        return hashlib.md5(question.encode()).hexdigest()[:8]
 
     @property
     def slug(self) -> str:
@@ -130,6 +138,8 @@ class Skill:
             "task_types": list(self.task_types),
             "keywords": list(self.keywords),
             "embedding": self.embedding,
+            "score_matrix": dict(self.score_matrix),
+            "pareto_frequency": self.pareto_frequency,
         }
 
     @classmethod
@@ -154,6 +164,8 @@ class Skill:
             task_types=data.get("task_types", []),
             keywords=data.get("keywords", []),
             embedding=data.get("embedding"),
+            score_matrix=data.get("score_matrix", {}),
+            pareto_frequency=data.get("pareto_frequency", 0.0),
         )
 
 

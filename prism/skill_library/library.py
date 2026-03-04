@@ -128,6 +128,8 @@ class SkillLibrary:
                 "pitfalls": skill.pitfalls,
                 "created_at": skill.created_at,
                 "embedding": skill.embedding,
+                "score_matrix": dict(skill.score_matrix),
+                "pareto_frequency": skill.pareto_frequency,
             }
         meta_path = self._path / "_meta.json"
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -178,6 +180,8 @@ class SkillLibrary:
                     skill.pitfalls = m.get("pitfalls", [])
                     skill.created_at = m.get("created_at", skill.created_at)
                     skill.embedding = m.get("embedding")
+                    skill.score_matrix = m.get("score_matrix", {})
+                    skill.pareto_frequency = m.get("pareto_frequency", 0.0)
 
                 self._skills[skill.skill_id] = skill
             except (ValueError, KeyError) as e:

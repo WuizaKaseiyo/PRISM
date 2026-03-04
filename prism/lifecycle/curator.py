@@ -11,12 +11,20 @@ from prism.utils import extract_json_from_text
 
 logger = logging.getLogger(__name__)
 
-# Lifecycle thresholds
+# Lifecycle thresholds (legacy kept for backward compat)
 RETIRE_GAP = 3
 SPECIALIZE_VARIANCE = 0.20
 MIN_EVALS_FOR_LIFECYCLE = 5
 MERGE_KEYWORD_OVERLAP = 0.60
 MAX_SKILL_CONTENT_CHARS = 8000  # ~2000 tokens; cap ENRICH growth
+
+# Pareto-based thresholds
+EPSILON = 0.05                    # soft domination threshold
+MIN_SHARED_INSTANCES = 3          # minimum shared tasks to compare two skills
+SPECIALIZE_PARETO_FREQ = 0.4     # must be Pareto-optimal >=40% of the time
+SPECIALIZE_HARMFUL_RATIO = 0.25  # AND harmful ratio >=25%
+COVERAGE_SCORE_THRESHOLD = 0.3   # instances below this are "uncovered"
+MIN_GAP_CLUSTER_SIZE = 2         # need >=2 uncovered instances for BIRTH
 
 
 BIRTH_OR_ENRICH_PROMPT = """Given these knowledge gaps and existing active skills, decide whether to CREATE a new skill or ENRICH an existing one.
@@ -55,12 +63,13 @@ Return ONLY a JSON object:
   "task_types": ["type1"]
 }}"""
 
-SPECIALIZE_PROMPT = """This skill has high variance in its evaluation scores, suggesting it works well for some tasks but poorly for others.
+SPECIALIZE_PROMPT = """This skill is Pareto-optimal on some tasks (useful) but harmful on others, suggesting it should be split into specialized children.
 
 Skill: {skill_name}
 Content: {skill_content}
 Description: {skill_description}
-Score variance: {variance:.3f}
+Pareto frequency: {pareto_frequency:.2f} (fraction of instances where skill is on the Pareto front)
+Harmful ratio: {harmful_ratio:.2f}
 Eval scores: {scores}
 
 Split this into 2 more specialized skills. Each child should handle a specific subset of use cases.
@@ -96,6 +105,110 @@ Return ONLY a JSON object:
 }}"""
 
 
+def _epsilon_dominates(a: Skill, b: Skill, eps: float = EPSILON) -> bool:
+    """Return True if skill A epsilon-dominates skill B.
+
+    A eps-dominates B iff:
+    - They share >= MIN_SHARED_INSTANCES task instances
+    - A >= B - eps on ALL shared instances
+    - A > B on at least one shared instance
+    """
+    shared_keys = set(a.score_matrix) & set(b.score_matrix)
+    if len(shared_keys) < MIN_SHARED_INSTANCES:
+        return False
+
+    strictly_better_on_one = False
+    for key in shared_keys:
+        if a.score_matrix[key] < b.score_matrix[key] - eps:
+            return False
+        if a.score_matrix[key] > b.score_matrix[key]:
+            strictly_better_on_one = True
+
+    return strictly_better_on_one
+
+
+def compute_pareto_front(skills: list[Skill]) -> set[str]:
+    """Return set of skill_ids that are Pareto-optimal (not eps-dominated by any other)."""
+    pareto: set[str] = set()
+    for skill in skills:
+        if not skill.score_matrix:
+            # No data — can't be dominated, include in front
+            pareto.add(skill.skill_id)
+            continue
+        dominated = False
+        for other in skills:
+            if other.skill_id == skill.skill_id:
+                continue
+            if _epsilon_dominates(other, skill):
+                dominated = True
+                break
+        if not dominated:
+            pareto.add(skill.skill_id)
+    return pareto
+
+
+def update_pareto_frequencies(skills: list[Skill]) -> None:
+    """Update pareto_frequency for each skill based on per-instance non-domination.
+
+    For each task key, skills within EPSILON of the best score are "non-dominated"
+    on that instance.  pareto_frequency = count_non_dominated / count_present.
+    """
+    # Collect all task keys across all skills
+    all_keys: set[str] = set()
+    for skill in skills:
+        all_keys.update(skill.score_matrix.keys())
+
+    if not all_keys:
+        return
+
+    # Per-skill tracking
+    present_count: dict[str, int] = {s.skill_id: 0 for s in skills}
+    nondom_count: dict[str, int] = {s.skill_id: 0 for s in skills}
+
+    for key in all_keys:
+        # Find skills present on this instance and the best score
+        present_skills: list[Skill] = []
+        best_score = float("-inf")
+        for skill in skills:
+            if key in skill.score_matrix:
+                present_skills.append(skill)
+                if skill.score_matrix[key] > best_score:
+                    best_score = skill.score_matrix[key]
+
+        for skill in present_skills:
+            present_count[skill.skill_id] += 1
+            if skill.score_matrix[key] >= best_score - EPSILON:
+                nondom_count[skill.skill_id] += 1
+
+    for skill in skills:
+        if present_count[skill.skill_id] > 0:
+            skill.pareto_frequency = nondom_count[skill.skill_id] / present_count[skill.skill_id]
+        else:
+            skill.pareto_frequency = 0.0
+
+
+def _find_coverage_gaps(skills: list[Skill]) -> list[str]:
+    """Find task instances where all skills perform poorly.
+
+    Returns gap descriptions for BIRTH prompt if >= MIN_GAP_CLUSTER_SIZE uncovered instances.
+    """
+    # Collect all task keys and best score per key
+    best_scores: dict[str, float] = {}
+    for skill in skills:
+        for key, score in skill.score_matrix.items():
+            if key not in best_scores or score > best_scores[key]:
+                best_scores[key] = score
+
+    uncovered = [key for key, score in best_scores.items() if score < COVERAGE_SCORE_THRESHOLD]
+
+    if len(uncovered) >= MIN_GAP_CLUSTER_SIZE:
+        return [
+            f"Coverage gap: {len(uncovered)} task instances where best skill score < {COVERAGE_SCORE_THRESHOLD} "
+            f"(task keys: {', '.join(uncovered[:5])}{'...' if len(uncovered) > 5 else ''})"
+        ]
+    return []
+
+
 class SkillCurator:
     def __init__(
         self,
@@ -127,23 +240,31 @@ class SkillCurator:
             else:
                 skill.neutral_count += 1
 
-        # RETIRE: deactivate skills where harmful - helpful > RETIRE_GAP
+        # Update Pareto frequencies for all active skills
+        active = self.library.list_active(module_tag)
+        update_pareto_frequencies(active)
+
+        # RETIRE: soft domination (with fallback to harmful-ratio heuristic)
         retired = self._retire(module_tag)
         if retired:
             ops_performed.append("RETIRE")
 
-        # BIRTH or ENRICH from gaps
-        if reflection.gaps:
-            action = self._birth_or_enrich(reflection.gaps, module_tag, task_type)
+        # BIRTH or ENRICH from gaps (including coverage gap detection)
+        all_gaps = list(reflection.gaps)
+        coverage_gaps = _find_coverage_gaps(active)
+        if coverage_gaps:
+            all_gaps.extend(coverage_gaps)
+        if all_gaps:
+            action = self._birth_or_enrich(all_gaps, module_tag, task_type)
             if action:
                 ops_performed.append(action)
 
-        # SPECIALIZE: split high-variance skills
+        # SPECIALIZE: Pareto-optimal + harmful → split into specialized children
         specialized = self._specialize(module_tag)
         if specialized:
             ops_performed.append("SPECIALIZE")
 
-        # GENERALIZE: merge overlapping skills
+        # GENERALIZE: merge overlapping skills (unchanged)
         generalized = self._generalize(module_tag)
         if generalized:
             ops_performed.append("GENERALIZE")
@@ -267,14 +388,24 @@ class SkillCurator:
         for skill in active:
             if skill.total_evals < MIN_EVALS_FOR_LIFECYCLE:
                 continue
-            if skill.score_variance < SPECIALIZE_VARIANCE:
+
+            harmful_ratio = skill.harmful_count / skill.total_evals if skill.total_evals > 0 else 0.0
+
+            # New trigger: Pareto-optimal often (useful) AND harmful sometimes
+            if skill.pareto_frequency < SPECIALIZE_PARETO_FREQ or harmful_ratio < SPECIALIZE_HARMFUL_RATIO:
                 continue
+
+            logger.info(
+                "[Curator] SPECIALIZE candidate: %s (pareto_freq=%.2f, harmful_ratio=%.2f)",
+                skill.skill_id, skill.pareto_frequency, harmful_ratio,
+            )
 
             prompt = SPECIALIZE_PROMPT.format(
                 skill_name=skill.name,
                 skill_content=skill.content,
                 skill_description=skill.description,
-                variance=skill.score_variance,
+                pareto_frequency=skill.pareto_frequency,
+                harmful_ratio=harmful_ratio,
                 scores=skill.eval_scores[-10:],
             )
 
@@ -360,10 +491,32 @@ class SkillCurator:
         active = self.library.list_active(module_tag)
         did_retire = False
         for skill in active:
-            if skill.harmful_count - skill.helpful_count > RETIRE_GAP:
-                skill.status = "retired"
-                logger.info("[Curator] RETIRE: %s (net_value=%d)", skill.skill_id, skill.net_value)
-                did_retire = True
+            # Primary: retire if epsilon-dominated by another active skill
+            if len(skill.score_matrix) >= MIN_EVALS_FOR_LIFECYCLE:
+                dominated_by = None
+                for other in active:
+                    if other.skill_id == skill.skill_id:
+                        continue
+                    if _epsilon_dominates(other, skill):
+                        dominated_by = other.skill_id
+                        break
+                if dominated_by:
+                    skill.status = "retired"
+                    logger.info(
+                        "[Curator] RETIRE: %s dominated by %s", skill.skill_id, dominated_by
+                    )
+                    did_retire = True
+                    continue
+
+            # Fallback: retire if harmful_ratio > 0.7 with sufficient evals
+            if skill.total_evals >= MIN_EVALS_FOR_LIFECYCLE:
+                harmful_ratio = skill.harmful_count / skill.total_evals
+                if harmful_ratio > 0.7:
+                    skill.status = "retired"
+                    logger.info(
+                        "[Curator] RETIRE: %s (harmful_ratio=%.2f)", skill.skill_id, harmful_ratio
+                    )
+                    did_retire = True
         return did_retire
 
 

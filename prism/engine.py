@@ -7,6 +7,7 @@ from prism.assembler.assembler import SkillAssembler
 from prism.lifecycle.curator import SkillCurator
 from prism.lifecycle.reflector import PRISMReflector
 from prism.skill_library.library import SkillLibrary
+from prism.skill_library.skill import Skill
 from prism.task_index.index import TaskTypeIndex
 
 logger = logging.getLogger(__name__)
@@ -107,27 +108,32 @@ class PRISMEngine:
         result["operations"] = ops
         logger.info("[Step %d] CURATE: %s", self._step_count, ops or "none")
 
-        # Step 5: DIFFERENTIAL EVALUATION
+        # Step 5: DIFFERENTIAL EVALUATION + score_matrix update
+        task_key = Skill.task_key(task.get("question", ""))
+
         if self.enable_differential_eval and skill_ids:
             bare_score = self._evaluate_without_skills(task)
             result["bare_score"] = bare_score
             result["differential"] = score - bare_score
+            effective_score = score - bare_score
             logger.info(
                 "[Step %d] DIFFERENTIAL: with_skills=%.3f, without=%.3f, delta=%.3f",
                 self._step_count, score, bare_score, score - bare_score,
             )
 
-            # Update eval_scores on used skills
+            # Update eval_scores and score_matrix on used skills
             for sid in skill_ids:
                 skill = self.library.get(sid)
                 if skill:
                     skill.eval_scores.append(score)
+                    skill.score_matrix[task_key] = effective_score
         else:
             # Still record scores even without differential
             for sid in skill_ids:
                 skill = self.library.get(sid)
                 if skill:
                     skill.eval_scores.append(score)
+                    skill.score_matrix[task_key] = score
 
         # Step 6: INDEX UPDATE (EMA)
         for sid in skill_ids:

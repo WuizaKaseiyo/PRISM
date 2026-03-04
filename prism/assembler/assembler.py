@@ -12,6 +12,11 @@ from prism.utils import extract_json_from_text
 
 logger = logging.getLogger(__name__)
 
+# Pareto-aware selection constants
+EXPLORE_SLOTS = 1
+EXPLORE_BONUS_NEW = 0.6
+LIBRARY_MATURITY_THRESHOLD = 50
+
 
 def _cosine_similarity_pure(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
@@ -87,25 +92,57 @@ class SkillAssembler:
             if skill_id in scored:
                 scored[skill_id] = max(scored[skill_id], ema_score)
 
-        # Exploration bonus: give unevaluated skills a chance to be tried
-        # Score = 0.5 (midpoint) so they rank above untried indexed skills
-        # but below proven ones.  Decays once the skill accumulates evals.
-        EXPLORE_BONUS = 0.5
+        # Pareto boost: reward skills that are frequently Pareto-optimal
+        for skill in candidates:
+            if skill.pareto_frequency > 0:
+                scored[skill.skill_id] += 0.3 * skill.pareto_frequency
+
+        # Exploration bonus for unevaluated skills
         for skill in candidates:
             if skill.total_evals == 0 and scored[skill.skill_id] == 0.0:
-                scored[skill.skill_id] = EXPLORE_BONUS
+                scored[skill.skill_id] = EXPLORE_BONUS_NEW
 
-        # Sort by score descending
-        ranked = sorted(scored.items(), key=lambda x: x[1], reverse=True)
+        # Compute total library evals for adaptive exploration
+        total_library_evals = sum(s.total_evals for s in candidates)
+
+        # Split into exploit (Pareto-optimal) and explore (non-Pareto) pools
+        pareto_ids: set[str] = set()
+        for skill in candidates:
+            if skill.pareto_frequency > 0 or skill.total_evals == 0:
+                pareto_ids.add(skill.skill_id)
+
+        all_ranked = sorted(scored.items(), key=lambda x: x[1], reverse=True)
+        exploit_pool = [(sid, sc) for sid, sc in all_ranked if sid in pareto_ids]
+        explore_pool = [(sid, sc) for sid, sc in all_ranked if sid not in pareto_ids]
+
+        # Adaptive explore slots: more exploration when library is immature
+        explore_slots = EXPLORE_SLOTS
+        if total_library_evals < LIBRARY_MATURITY_THRESHOLD:
+            explore_slots = min(2, max(1, self.top_k // 2))
+        exploit_slots = self.top_k - explore_slots
+
+        # Fill ranked: exploit first, then explore, backfill from either
+        ranked: list[tuple[str, float]] = []
+        ranked.extend(exploit_pool[:exploit_slots])
+        ranked.extend(explore_pool[:explore_slots])
+        # Backfill remaining slots
+        remaining = self.top_k - len(ranked)
+        if remaining > 0:
+            used_ids = {sid for sid, _ in ranked}
+            backfill = [(sid, sc) for sid, sc in all_ranked if sid not in used_ids]
+            ranked.extend(backfill[:remaining])
+
+        # Re-sort final selection by score for consistent ordering
+        ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
 
         # Layer 4: LLM selection (only if candidates > top_k and llm_fn provided)
-        if len(ranked) > self.top_k and self.llm_fn is not None:
+        if len(all_ranked) > self.top_k and self.llm_fn is not None:
             candidate_summaries = []
-            for sid, sc in ranked:
+            for sid, sc in all_ranked:
                 skill = self.library.get(sid)
                 if skill:
                     candidate_summaries.append(
-                        f"  - {sid}: {skill.name} (score={sc:.2f}) — {skill.description}"
+                        f"  - {sid}: {skill.name} (score={sc:.2f}, pareto={skill.pareto_frequency:.2f}) — {skill.description}"
                     )
             prompt = (
                 f"Task: {task_text}\n\n"
