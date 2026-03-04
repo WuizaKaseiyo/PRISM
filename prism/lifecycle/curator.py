@@ -214,9 +214,11 @@ class SkillCurator:
         self,
         library: SkillLibrary,
         llm_fn: Callable[[str], str],
+        embed_fn: Callable[[str], list[float]] | None = None,
     ):
         self.library = library
         self.llm_fn = llm_fn
+        self.embed_fn = embed_fn
 
     def curate(
         self,
@@ -290,6 +292,11 @@ class SkillCurator:
             keywords=keywords or [],
             task_types=task_types or [task_type],
         )
+        if self.embed_fn:
+            try:
+                skill.embedding = self.embed_fn(skill.description)
+            except Exception as e:
+                logger.warning("[Curator] Failed to embed skill %s: %s", skill.name, e)
         self.library.add(skill)
         logger.info("[Curator] BIRTH: %s (%s)", skill.name, skill.skill_id)
         return skill
@@ -430,6 +437,11 @@ class SkillCurator:
                         keywords=child_data.get("keywords", skill.keywords.copy()),
                         task_types=child_data.get("task_types", skill.task_types.copy()),
                     )
+                    if self.embed_fn:
+                        try:
+                            child.embedding = self.embed_fn(child.description)
+                        except Exception as e:
+                            logger.warning("[Curator] Failed to embed child %s: %s", child.name, e)
                     self.library.add(child)
                     child_ids.append(child.skill_id)
 

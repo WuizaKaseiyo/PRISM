@@ -50,7 +50,7 @@ class PRISMEngine:
             token_budget=token_budget,
         )
         self.reflector = PRISMReflector(llm_fn=llm_fn)
-        self.curator = SkillCurator(library=self.library, llm_fn=llm_fn)
+        self.curator = SkillCurator(library=self.library, llm_fn=llm_fn, embed_fn=embed_fn)
 
         self._step_count = 0
         self._history: list[dict[str, Any]] = []
