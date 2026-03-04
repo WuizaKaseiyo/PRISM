@@ -252,7 +252,7 @@ When the LLM determines that an identified gap is best addressed by augmenting a
 
 A skill is a candidate for specialization when it is **both frequently Pareto-optimal and frequently harmful**:
 
-$$f(\sigma) \geq \theta_{\text{pareto}} \quad \text{AND} \quad \frac{\text{harmful\_count}}{\text{total\_evals}} \geq \theta_{\text{harmful}}$$
+$$f(\sigma) \geq \theta_{\text{pareto}} \quad \text{AND} \quad \frac{n_{\text{harmful}}}{n_{\text{evals}}} \geq \theta_{\text{harmful}}$$
 
 with $\theta_{\text{pareto}} = 0.4$ and $\theta_{\text{harmful}} = 0.25$, requiring at least 5 total evaluations. This trigger identifies skills that contain valuable knowledge for some task types but hurt performance on others — the ideal candidates for splitting.
 
