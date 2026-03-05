@@ -43,11 +43,14 @@ Existing approaches to context adaptation optimize either **monolithic prompts**
 
 **Problem 3 — Catastrophic forgetting under rewrite.** When an LLM rewrites accumulated context, it tends to compress or drop previously accumulated knowledge — a phenomenon known as "context collapse." Append-only strategies avoid this but lead to bloated, unfocused context over time.
 
+**Problem 4 — Skill injection attacks.** As skill-based systems become prevalent, they introduce a novel **supply chain security threat**: malicious instructions can be embedded within otherwise legitimate skill content. Unlike traditional prompt injection (adversarial text in data), skill injection is an *instruction-instruction conflict* — bad instructions hidden among good ones — making data-instruction separation defenses inapplicable. Furthermore, many instructions are **dual-use**: the same action (e.g., "backup files to external server") can be legitimate in one context but constitute data exfiltration in another. This contextual security challenge cannot be solved by model scaling alone; it depends fundamentally on what information the agent accesses and the semantic context of the task.
+
 **PRISM's answer:** Decompose knowledge into **independent, persistent skill units** that:
 - Are created, evaluated, and retired independently (no interference)
 - Can be selected in arbitrary combinations per task (compositional reuse)
 - Accumulate content via ENRICH (append-only) and are rewritten only under quality-controlled REFINE (no collapse)
 - Track per-instance performance via a score matrix, enabling Pareto-based lifecycle decisions
+- Are **self-generated and continuously curated**, providing inherent robustness to skill injection: harmful content is detected through performance degradation and removed via RETIRE, isolated via SPECIALIZE, or corrected via REFINE
 
 ### 1.5 The Score Matrix and Pareto-Based Lifecycle
 
@@ -73,8 +76,9 @@ PRISM introduces a **content-level quality gate** via the SkillValidator:
 
 - **Generation-time validation:** Every BIRTH/ENRICH/SPECIALIZE output is scored by an LLM on 5 dimensions (structural completeness, actionability, description alignment, internal consistency, differentiation). Skills below threshold are revised or discarded before entering the library.
 - **Periodic audit:** Active skills are periodically re-assessed and REFINED (full content rewrite) when quality has degraded or content has become bloated from repeated enrichment.
+- **Implicit security screening:** Because skills are self-generated through reflection on execution traces and filtered through quality gates, they inherit the trust properties of the base model rather than requiring external audit of potentially adversarial content.
 
-This creates a dual feedback loop: task outcomes drive lifecycle decisions (retire, specialize), while content quality drives content improvement (validate, refine). The two signals are complementary and independently actionable.
+This creates a dual feedback loop: task outcomes drive lifecycle decisions (retire, specialize), while content quality drives content improvement (validate, refine). The two signals are complementary and independently actionable. Critically, this architecture also provides **defense-in-depth against skill injection**: even if adversarial content entered the library (e.g., through manipulated task inputs), the continuous lifecycle operations would detect and remove it through performance-based retirement or quality-driven refinement.
 
 ### 1.7 The PRISM Loop
 
@@ -117,6 +121,8 @@ The library L persists across tasks and epochs, with each skill independently ac
 
 **H4 — The dual feedback loop (outcome + content quality) converges faster.** Outcome signals tell the system *which* skills to keep; quality signals tell the system *how* to improve them. The combination reduces the number of tasks needed to build an effective library.
 
+**H5 — Lifecycle operations provide natural robustness to skill injection attacks.** Even if malicious content were introduced into a skill (through adversarial task inputs or corrupted reflection), PRISM's continuous curation mechanisms would neutralize it: harmful skills are RETIRED through Pareto-based domination or high harmful-ratio detection; inconsistent skills are SPECIALIZED to isolate problematic content; and REFINE operations rewrite degraded content under quality gates. The system's self-correcting dynamics make injected attacks transient rather than persistent.
+
 ---
 
 ## 2. Method
@@ -157,6 +163,20 @@ The differential evaluation runs the same task twice — once with the augmented
 
 The matrix is inherently sparse: each skill is only evaluated on instances where the Assembler selected it. This sparsity is handled explicitly in all downstream computations (§2.5).
 
+**Why hash the task question?** The full question text can be arbitrarily long, but an 8-character hex hash (truncated MD5) provides a compact, fixed-size identifier. With 16^8 ≈ 4 billion unique values, collision probability is negligible for typical dataset sizes. This enables efficient storage and lookup while preserving instance-level granularity.
+
+**Example score matrix.** Consider a library with three skills evaluated across five task instances. Each cell contains the differential score $\delta$ (positive = skill helped, negative = skill hurt, empty = skill not selected for that task):
+
+| | inst 1 | inst 2 | inst 3 | inst 4 | inst 5 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **algebra_tricks** | +0.3 | — | +0.1 | +0.4 | — |
+| **geometry_basics** | — | +0.2 | −0.1 | — | +0.5 |
+| **number_theory** | +0.1 | +0.3 | — | −0.2 | +0.2 |
+
+From this matrix we can compute:
+- **Pareto frequency of algebra_tricks**: On inst 1, it scores +0.3 vs number_theory's +0.1 → non-dominated. On inst 3, +0.1 vs geometry's −0.1 → non-dominated. On inst 4, +0.4 vs number_theory's −0.2 → non-dominated. Pareto frequency = 3/3 = 1.0.
+- **ε-domination check**: Does algebra_tricks dominate number_theory? Shared instances: {inst 1, inst 4} (inst 3 missing for number_theory). Scores: A=[+0.3, +0.4] vs N=[+0.1, −0.2]. A ≥ N on all shared instances and A > N on at least one → algebra_tricks ε-dominates number_theory (pending ≥ 3 shared instances).
+
 ### 2.4 Pareto Frequency
 
 After each curation step, the system computes per-skill **Pareto frequency** — the fraction of evaluated instances on which a skill is non-dominated.
@@ -182,8 +202,36 @@ To make lifecycle decisions, we define a conservative domination relation. Skill
 1. They share at least $n_{\min} = 3$ evaluated instances: $|K_a \cap K_b| \geq n_{\min}$, where $K_\sigma = \text{keys}(S[\sigma])$
 2. On every shared instance, $\sigma_a$ scores at least as well (within tolerance): $\forall j \in K_a \cap K_b: S[\sigma_a][j] \geq S[\sigma_b][j] - \varepsilon$
 3. On at least one shared instance, $\sigma_a$ is strictly better: $\exists j \in K_a \cap K_b: S[\sigma_a][j] > S[\sigma_b][j]$
+4. The skills are semantically similar (competing for the same niche): $\text{sim}(\sigma_a, \sigma_b) \geq \theta_{\text{sim}}$, where $\text{sim}(A, B) = \cos(\text{emb}(A.\text{description}), \text{emb}(B.\text{description}))$ and $\theta_{\text{sim}} = 0.5$
 
-Condition 1 prevents premature retirement when two skills have insufficient comparison data. The $\varepsilon$ tolerance in condition 2 avoids retiring a skill that is only marginally worse on some instances — it must be consistently dominated, not just occasionally slightly behind.
+**Why conditions 1-3?** Condition 1 prevents premature retirement when two skills have insufficient comparison data. The $\varepsilon$ tolerance in condition 2 avoids retiring a skill that is only marginally worse on some instances — it must be consistently dominated, not just occasionally slightly behind.
+
+**Why condition 4 (semantic similarity)?** Domination comparisons only make sense between skills that compete for the same niche. A geometry skill shouldn't be retired because an algebra skill "dominates" it on algebra tasks — they serve different purposes. If $\text{sim}(A, B) < \theta_{\text{sim}}$, the skills target different task types and neither can dominate the other regardless of scores. This prevents semantically inappropriate retirements (apples vs oranges).
+
+**The correlation-causation problem.** Conditions 1-3 can still be too aggressive because the score matrix records **correlation, not causation**. When skills A and B are frequently co-selected for the same tasks, they receive identical differential scores on those instances — both get credit when the task succeeds, both get blamed when it fails. Skill A may appear to ε-dominate skill B simply because they were always selected together and A happened to also be selected on a few additional successful instances. But B may have **independent causal contribution** that we never observe because B was never tested in isolation.
+
+Consider the example: an "algebra_tricks" skill and a "geometry_basics" skill are co-selected on instances 1-5 (mixed problem sets), both scoring [+0.3, +0.2, +0.4, +0.1, +0.3]. The algebra skill is additionally selected alone on instances 6-7 (pure algebra problems), scoring [+0.2, +0.1]. By conditions 1-3 alone, algebra_tricks would "dominate" geometry_basics. But this is doubly spurious: (1) the skills serve different purposes — $\text{sim}(\text{algebra}, \text{geometry}) < \theta_{\text{sim}}$ — so condition 4 fails and dominance check should not apply; (2) even if they were similar, we have no evidence that algebra alone caused the shared successes on instances 1-5. Geometry might be equally effective on geometry-related aspects of those problems; we simply never tested geometry without algebra.
+
+**Solution: Exclude co-selected instances from domination checks.** The fundamental issue is that shared instances where both skills were selected provide no causal evidence — we cannot attribute the outcome to either skill. The fix is to base domination purely on **independent instances** where exactly one of the two skills was selected.
+
+Define the independent instance sets:
+- $K_a^{\text{only}} = K_a \setminus K_b$ — instances where A was selected but B was not
+- $K_b^{\text{only}} = K_b \setminus K_a$ — instances where B was selected but A was not
+
+We revise conditions 1-3 to operate only on independent instances:
+
+1. **Sufficient independent evidence**: Both skills have been tested independently at least $n_{\min}$ times: $|K_a^{\text{only}}| \geq n_{\min}$ AND $|K_b^{\text{only}}| \geq n_{\min}$
+2. **A's independent performance exceeds B's**: A's average score on its independent instances is strictly better than B's (with tolerance): $\text{mean}(S[\sigma_a][K_a^{\text{only}}]) > \text{mean}(S[\sigma_b][K_b^{\text{only}}]) + \varepsilon$
+
+Returning to the example: A and B are co-selected on instances 1-5, so these are excluded. A has independent instances 6-7 with scores [+0.2, +0.1], mean = +0.15. But B has **no independent instances** ($K_b^{\text{only}} = \emptyset$), so condition 1 fails. A cannot dominate B until B has been tested independently — which is correct, since we have no causal evidence about B's standalone performance.
+
+This approach has a practical implication: the Assembler should occasionally select skills **independently** (not always in combination) to populate the independent instance sets and enable meaningful domination comparisons.
+
+**Attribution-based reinforcement.** As a secondary signal, the Reflector's per-skill attributions provide explicit causal reasoning. If skill B consistently receives "helpful" attributions from the Reflector (even when co-selected with A), this serves as evidence of independent contribution and blocks domination. Formally, we can require:
+
+$$\frac{\text{helpful}_b}{\text{helpful}_b + \text{harmful}_b + \text{neutral}_b} < \theta_{\text{attr}}$$
+
+before allowing A to dominate B, where $\theta_{\text{attr}} = 0.3$. A skill with a high helpful ratio has demonstrated causal value through the Reflector's analysis and should not be retired based on score correlation alone.
 
 A skill is **Pareto-optimal** if no other active skill $\varepsilon$-dominates it. The set of Pareto-optimal skills forms the **Pareto front** of the library.
 
