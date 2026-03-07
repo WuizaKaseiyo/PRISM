@@ -17,15 +17,16 @@ task ──→ ① RETRIEVE   4-layer skill retrieval (filter → embedding → 
          ⑥ INDEX      Update EMA scores for future retrieval
 ```
 
-### 5 Skill Lifecycle Operations
+### 6 Skill Lifecycle Operations
 
 | Operation | Trigger | What Happens |
 |-----------|---------|-------------|
-| **BIRTH** | Knowledge gap found, no matching skill | LLM creates a new skill |
-| **ENRICH** | Gap matches existing skill | Append strategy content (no rewrite) |
-| **SPECIALIZE** | Skill has high score variance (>0.20) after 5+ evals | LLM splits into 2 focused children |
+| **BIRTH** | Coverage gap: best score < 0.3 on ≥2 instances | LLM creates a new skill |
+| **ENRICH** | Gap matches existing skill | Append strategy content (8k char budget) |
+| **SPECIALIZE** | Pareto freq ≥ 0.4 AND harmful ratio ≥ 0.25 (5+ evals) | LLM splits into 2 focused children |
 | **GENERALIZE** | Two skills share ≥60% keyword overlap (Jaccard) | Merge into one combined skill |
-| **RETIRE** | harmful - helpful > 3 | Deactivate the skill |
+| **RETIRE** | ε-dominated by another skill (ε=0.05, ≥3 shared instances) | Deactivate the skill |
+| **REFINE** | Quality audit (periodic) | Full content rewrite preserving core strategies |
 
 ## Quick Start
 
@@ -54,15 +55,20 @@ OPENROUTER_MODEL="google/gemini-2.5-flash-preview"
 python examples/run_prism.py
 ```
 
-### 4. AIME 2025 Benchmark
+### 4. Benchmarks
 
 ```bash
 pip install pandas pyarrow
 
+# AIME 2025 (30 competition math problems)
 python -m evaluate.aime2025                        # all 30 problems
 python -m evaluate.aime2025 --problems 7           # single problem
 python -m evaluate.aime2025 --problems 1-5,20,25   # mix ranges and singles
 python -m evaluate.aime2025 --eval-only            # eval existing skills (no training)
+
+# HotpotQA (multi-hop QA, F1 scoring)
+python -m evaluate.hotpot_qa --n-train 150 --n-val 50 --epochs 2
+python -m evaluate.hotpot_qa --no-differential     # skip differential eval (faster)
 ```
 
 ## Usage
@@ -128,9 +134,10 @@ prism/
 │   │   └── assembler.py         # 4-layer retrieval (filter→cosine→EMA→LLM)
 │   └── lifecycle/
 │       ├── reflector.py         # LLM-based trace analysis → attributions + gaps
-│       └── curator.py           # 5 operations: BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE
+│       └── curator.py           # 6 operations: BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE/REFINE
 ├── evaluate/
-│   └── aime2025/                # AIME 2025 benchmark (30 competition math problems)
+│   ├── aime2025/                # AIME 2025 benchmark (30 competition math problems)
+│   └── hotpot_qa/               # HotpotQA benchmark (multi-hop QA, F1 scoring)
 ├── examples/
 │   └── run_prism.py             # Full demo with OpenRouter
 ├── pyproject.toml
@@ -191,15 +198,22 @@ def embed_fn(text: str) -> list[float]:
 
 ## Tuning
 
-Edit constants in `prism/lifecycle/curator.py`:
+Edit constants in `prism/lifecycle/curator.py` and `prism/assembler/assembler.py`:
 
 | Constant | Default | Effect |
 |----------|---------|--------|
-| `RETIRE_GAP` | 3 | Higher = more tolerant of harmful skills |
-| `SPECIALIZE_VARIANCE` | 0.20 | Lower = split skills more aggressively |
+| `EPSILON` | 0.05 | Soft ε-domination threshold for RETIRE |
+| `MIN_SHARED_INSTANCES` | 3 | Minimum shared tasks to compare two skills |
+| `SPECIALIZE_PARETO_FREQ` | 0.40 | Pareto frequency threshold for SPECIALIZE |
+| `SPECIALIZE_HARMFUL_RATIO` | 0.25 | Harmful ratio threshold for SPECIALIZE |
 | `MIN_EVALS_FOR_LIFECYCLE` | 5 | Minimum evaluations before SPECIALIZE triggers |
+| `COVERAGE_SCORE_THRESHOLD` | 0.3 | Instances scoring below this are "uncovered" |
+| `MIN_GAP_CLUSTER_SIZE` | 2 | Need ≥2 uncovered instances to trigger BIRTH |
 | `MERGE_KEYWORD_OVERLAP` | 0.60 | Lower = merge skills more aggressively |
 | `MAX_SKILL_CONTENT_CHARS` | 8000 | Cap on skill content length (~2000 tokens) |
+| `EXPLORE_SLOTS` | 1 | Explore slots for untested skills in retrieval |
+| `EXPLORE_BONUS_NEW` | 0.6 | Score bonus for unevaluated skills |
+| `LIBRARY_MATURITY_THRESHOLD` | 50 | Total evals before library is "mature" |
 
 ## Design Decisions
 
@@ -209,6 +223,7 @@ Edit constants in `prism/lifecycle/curator.py`:
 | Directory-per-skill storage | Claude Code compatible SKILL.md + centralized _meta.json for tracking |
 | 3-strategy JSON extraction | LLM output unreliable: direct parse → code block → brace counting |
 | EMA scoring (alpha=0.3) | Remembers history while responding quickly to changes |
+| Per-instance score matrix | Enables Pareto-based lifecycle (ε-domination, coverage gaps) |
 | Differential eval is optional | Avoids doubling API cost when not needed |
 | Skills have parent/children | Tracks lineage through SPECIALIZE operations |
 | Exploration bonus for new skills | Prevents cold-start dead loop for newly created skills |

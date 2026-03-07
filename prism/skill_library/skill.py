@@ -29,7 +29,7 @@ class Skill:
     task_types: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     embedding: list[float] | None = None
-    score_matrix: dict[str, float] = field(default_factory=dict)
+    score_matrix: dict[str, Any] = field(default_factory=dict)  # key → {delta, attributed, co_skills, solo} or float (legacy)
     pareto_frequency: float = 0.0
 
     @staticmethod

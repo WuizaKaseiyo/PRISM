@@ -25,6 +25,27 @@ SPECIALIZE_PARETO_FREQ = 0.4     # must be Pareto-optimal >=40% of the time
 SPECIALIZE_HARMFUL_RATIO = 0.25  # AND harmful ratio >=25%
 COVERAGE_SCORE_THRESHOLD = 0.3   # instances below this are "uncovered"
 MIN_GAP_CLUSTER_SIZE = 2         # need >=2 uncovered instances for BIRTH
+SEMANTIC_SIM_THRESHOLD = 0.5     # condition 4: cross-niche domination gate
+
+
+def _get_attributed(entry) -> float:
+    """Extract attributed delta from a score matrix entry.
+
+    Handles both old format (plain float) and new format (dict with 'attributed' key).
+    """
+    if isinstance(entry, dict):
+        return entry.get("attributed", entry.get("delta", 0.0))
+    return float(entry)
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Pure-python cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 BIRTH_OR_ENRICH_PROMPT = """Given these knowledge gaps and existing active skills, decide whether to CREATE a new skill or ENRICH an existing one.
@@ -38,18 +59,38 @@ Active skills:
 If a gap closely matches an existing skill, return ENRICH with additional content to append.
 If the gap represents genuinely new knowledge, return CREATE with full skill details.
 
-For CREATE, generate a skill in Claude Code format:
-- "name": human-readable skill name (e.g. "Exact Format Matching")
-- "description": trigger condition starting with "Use when..." — be specific and pushy
-- "content": a FULL markdown document (50-200 lines) with:
-  - `# Title` heading
-  - `## Overview` section explaining what this skill does
-  - `## Workflow` section with numbered steps
-  - `## Examples` or `## Key Principles` sections as appropriate
-  - Code examples in fenced blocks where applicable
-  Do NOT write a one-liner. Write substantial operational instructions.
+## Quality Requirements for Skill Content
 
-For ENRICH, provide a markdown section to append (with ## heading and content).
+A good skill is a reusable decision-making guide that changes how a model reasons — NOT a textbook summary or generic advice. Apply these principles:
+
+**1. Concrete over abstract.** Every instruction must be actionable. Bad: "Consider edge cases." Good: "Check n=0, n=1, and n=negative separately before applying the general formula."
+
+**2. Decision procedures, not descriptions.** Write IF-THEN rules the model can follow. Bad: "Modular arithmetic is useful for remainder problems." Good: "When the problem asks for 'the last k digits' or 'remainder when divided by m': (1) Identify the modulus m, (2) Reduce the base mod m, (3) Apply Euler's theorem if gcd(base,m)=1, (4) Otherwise factor m and use CRT."
+
+**3. Worked examples with reasoning.** Include at least one Input → Reasoning → Output example showing exactly how to apply the workflow. Show the decision points, not just the answer.
+
+**4. Explain WHY, not just WHAT.** Instead of "Always verify your answer", write "Verify by substituting back into the original equation — competition problems often have extraneous solutions introduced by squaring or cross-multiplying."
+
+**5. Generalize across the problem class.** The skill must help with ALL problems of this type, not just the one that triggered creation. Identify the common structure: what makes these problems similar? What varies?
+
+**6. No filler.** Remove anything the model already knows or that doesn't change behavior. "Read the problem carefully" and "Show your work" are worthless. Every sentence must provide information the model wouldn't have without this skill.
+
+**7. Pitfalls are high-value.** Specific common mistakes for this problem type are among the most useful content. Format as: "PITFALL: [what goes wrong] → FIX: [what to do instead]."
+
+## Format
+
+For CREATE:
+- "name": concise skill name describing the method (e.g. "CRT-Based Modular Reduction")
+- "description": trigger condition starting with "Use when..." — specific enough to match the right problems, broad enough to cover the class. Be pushy: include concrete signal words/patterns.
+- "content": a FULL markdown document (50-200 lines) with:
+  - `# Title`
+  - `## Overview` — what class of problems this solves and why a specialized approach is needed
+  - `## Workflow` — numbered decision procedure with IF-THEN branches
+  - `## Worked Example` — at least one full Input → Reasoning → Output
+  - `## Pitfalls` — common mistakes and their fixes
+  Do NOT write generic advice. Every line must earn its place.
+
+For ENRICH, provide a markdown section (with ## heading) containing NEW decision procedures, examples, or pitfalls — not restatements of what the skill already contains.
 
 Return ONLY a JSON object:
 {{
@@ -72,32 +113,32 @@ Pareto frequency: {pareto_frequency:.2f} (fraction of instances where skill is o
 Harmful ratio: {harmful_ratio:.2f}
 Eval scores: {scores}
 
-Split this into 2 more specialized skills. Each child should handle a specific subset of use cases.
+Analyze the parent skill's content to identify which parts help vs hurt. Split into 2 children where each child:
+- Handles a DISTINCT subset of problems (no overlap in trigger conditions)
+- Contains ONLY the strategies relevant to its subset
+- Has a narrower, more specific trigger description
 
-Each child must be a FULL Claude Code format skill:
-- "name": human-readable skill name (e.g. "Linear Equation Solving")
-- "description": trigger condition starting with "Use when..." — be specific about when this child applies
-- "content": a FULL markdown document (50-200 lines) with:
-  - `# Title` heading
-  - `## Overview` section
-  - `## Workflow` section with numbered steps
-  - `## Examples` or `## Key Principles` sections as appropriate
-  Do NOT write a one-liner. Write substantial operational instructions.
+Each child must follow these quality requirements:
+- Concrete decision procedures (IF-THEN rules), not abstract advice
+- At least one worked example showing Input → Reasoning → Output
+- Specific pitfalls for this subtype with fixes
+- No filler — every sentence must change model behavior
+- Explain WHY each step matters, not just WHAT to do
 
 Return ONLY a JSON object:
 {{
   "children": [
     {{
       "name": "Specialized Name 1",
-      "description": "Use when the task involves...",
-      "content": "# Specialized Name 1\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n2. ...",
+      "description": "Use when the task involves... (specific trigger)",
+      "content": "# Title\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n\\n## Worked Example\\n...\\n\\n## Pitfalls\\n...",
       "keywords": ["kw1"],
       "task_types": ["type1"]
     }},
     {{
       "name": "Specialized Name 2",
-      "description": "Use when the task involves...",
-      "content": "# Specialized Name 2\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n2. ...",
+      "description": "Use when the task involves... (specific trigger)",
+      "content": "# Title\\n\\n## Overview\\n...\\n\\n## Workflow\\n1. ...\\n\\n## Worked Example\\n...\\n\\n## Pitfalls\\n...",
       "keywords": ["kw1"],
       "task_types": ["type1"]
     }}
@@ -109,19 +150,28 @@ def _epsilon_dominates(a: Skill, b: Skill, eps: float = EPSILON) -> bool:
     """Return True if skill A epsilon-dominates skill B.
 
     A eps-dominates B iff:
-    - They share >= MIN_SHARED_INSTANCES task instances
-    - A >= B - eps on ALL shared instances
-    - A > B on at least one shared instance
+    1. They share >= MIN_SHARED_INSTANCES task instances
+    2. A >= B - eps on ALL shared instances
+    3. A > B on at least one shared instance
+    4. Semantic similarity >= SEMANTIC_SIM_THRESHOLD (if embeddings available)
     """
+    # Condition 4: semantic similarity gate — prevent cross-niche domination
+    if a.embedding is not None and b.embedding is not None:
+        sim = _cosine_sim(a.embedding, b.embedding)
+        if sim < SEMANTIC_SIM_THRESHOLD:
+            return False
+
     shared_keys = set(a.score_matrix) & set(b.score_matrix)
     if len(shared_keys) < MIN_SHARED_INSTANCES:
         return False
 
     strictly_better_on_one = False
     for key in shared_keys:
-        if a.score_matrix[key] < b.score_matrix[key] - eps:
+        a_score = _get_attributed(a.score_matrix[key])
+        b_score = _get_attributed(b.score_matrix[key])
+        if a_score < b_score - eps:
             return False
-        if a.score_matrix[key] > b.score_matrix[key]:
+        if a_score > b_score:
             strictly_better_on_one = True
 
     return strictly_better_on_one
@@ -172,12 +222,13 @@ def update_pareto_frequencies(skills: list[Skill]) -> None:
         for skill in skills:
             if key in skill.score_matrix:
                 present_skills.append(skill)
-                if skill.score_matrix[key] > best_score:
-                    best_score = skill.score_matrix[key]
+                score = _get_attributed(skill.score_matrix[key])
+                if score > best_score:
+                    best_score = score
 
         for skill in present_skills:
             present_count[skill.skill_id] += 1
-            if skill.score_matrix[key] >= best_score - EPSILON:
+            if _get_attributed(skill.score_matrix[key]) >= best_score - EPSILON:
                 nondom_count[skill.skill_id] += 1
 
     for skill in skills:
@@ -195,7 +246,8 @@ def _find_coverage_gaps(skills: list[Skill]) -> list[str]:
     # Collect all task keys and best score per key
     best_scores: dict[str, float] = {}
     for skill in skills:
-        for key, score in skill.score_matrix.items():
+        for key, entry in skill.score_matrix.items():
+            score = _get_attributed(entry)
             if key not in best_scores or score > best_scores[key]:
                 best_scores[key] = score
 
@@ -241,6 +293,14 @@ class SkillCurator:
                 skill.harmful_count += 1
             else:
                 skill.neutral_count += 1
+
+        # NO-OP: skip curation when skills performed well and no gaps identified
+        has_harmful = any(
+            attr.get("tag") == "harmful" for attr in reflection.attributions
+        )
+        if reflection.attributions and not has_harmful and not reflection.gaps:
+            logger.info("[Curator] NO-OP: all skills helpful/neutral, no gaps")
+            return []
 
         # Update Pareto frequencies for all active skills
         active = self.library.list_active(module_tag)
@@ -301,6 +361,51 @@ class SkillCurator:
         logger.info("[Curator] BIRTH: %s (%s)", skill.name, skill.skill_id)
         return skill
 
+    def _blind_compare(self, old_content: str, new_content: str, description: str) -> str:
+        """Blind comparison of two skill versions. Returns 'A' or 'B' (winner)."""
+        import random
+        # Randomize presentation order to eliminate position bias
+        if random.random() < 0.5:
+            version_a, version_b = old_content, new_content
+            mapping = {"A": "old", "B": "new"}
+        else:
+            version_a, version_b = new_content, old_content
+            mapping = {"A": "new", "B": "old"}
+
+        prompt = f"""Compare two versions of a skill document for the following purpose:
+"{description}"
+
+## Version A
+{version_a[:3000]}
+
+## Version B
+{version_b[:3000]}
+
+Evaluate on these criteria:
+1. **Actionability**: Does it provide concrete IF-THEN decision procedures?
+2. **Specificity**: Does it contain worked examples and specific pitfalls?
+3. **Organization**: Is it well-structured with clear sections?
+4. **Non-redundancy**: Does it avoid repeating itself?
+
+Which version is better overall? Return ONLY a JSON object:
+{{"winner": "A" or "B", "reason": "one sentence"}}"""
+
+        try:
+            response = self.llm_fn(prompt)
+            parsed = extract_json_from_text(response)
+            if parsed and "winner" in parsed:
+                winner_label = parsed["winner"].strip().upper()
+                if winner_label in ("A", "B"):
+                    winner = mapping.get(winner_label, "new")
+                    logger.info(
+                        "[Curator] Blind compare: %s wins (%s)",
+                        winner, parsed.get("reason", ""),
+                    )
+                    return winner
+        except Exception as e:
+            logger.warning("[Curator] Blind compare failed: %s", e)
+        return "new"  # default: accept new version
+
     def _enrich(self, skill_id: str, enrich_content: str) -> bool:
         skill = self.library.get(skill_id)
         if skill is None:
@@ -308,30 +413,31 @@ class SkillCurator:
         if not enrich_content.strip():
             return False
 
+        old_content = skill.content
         new_section = enrich_content.strip()
         proposed = skill.content.rstrip() + "\n\n" + new_section + "\n"
 
         if len(proposed) <= MAX_SKILL_CONTENT_CHARS:
-            # Fits within budget — append normally
-            skill.content = proposed
+            proposed_final = proposed
         else:
             # Over budget — drop the oldest enrichment section to make room.
-            # Enrichment sections are ## headings added after the original body.
-            # Find all ## sections, keep the core (everything up to the first
-            # enrichment), drop the oldest enrichment, then append the new one.
             import re
-            # Split on ## headings (keep delimiters)
             parts = re.split(r"(?=\n## )", skill.content)
             if len(parts) > 2:
-                # Drop the second part (first enrichment) to make room
                 parts.pop(1)
             trimmed = "".join(parts).rstrip()
-            skill.content = trimmed + "\n\n" + new_section + "\n"
+            proposed_final = trimmed + "\n\n" + new_section + "\n"
 
-            # If still over budget (new section itself is huge), hard-truncate
-            if len(skill.content) > MAX_SKILL_CONTENT_CHARS:
-                skill.content = skill.content[:MAX_SKILL_CONTENT_CHARS].rstrip() + "\n"
+            if len(proposed_final) > MAX_SKILL_CONTENT_CHARS:
+                proposed_final = proposed_final[:MAX_SKILL_CONTENT_CHARS].rstrip() + "\n"
 
+        # Blind comparison: reject if new version is worse
+        winner = self._blind_compare(old_content, proposed_final, skill.description)
+        if winner == "old":
+            logger.info("[Curator] ENRICH rejected for %s: old version better", skill.skill_id)
+            return False
+
+        skill.content = proposed_final
         logger.info("[Curator] ENRICH: %s with content: %s", skill.skill_id, enrich_content[:50])
         return True
 

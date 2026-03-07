@@ -4,7 +4,7 @@ import logging
 from typing import Any, Callable
 
 from prism.assembler.assembler import SkillAssembler
-from prism.lifecycle.curator import SkillCurator
+from prism.lifecycle.curator import EPSILON, SkillCurator
 from prism.lifecycle.reflector import PRISMReflector
 from prism.skill_library.library import SkillLibrary
 from prism.skill_library.skill import Skill
@@ -110,30 +110,53 @@ class PRISMEngine:
 
         # Step 5: DIFFERENTIAL EVALUATION + score_matrix update
         task_key = Skill.task_key(task.get("question", ""))
+        solo = len(skill_ids) == 1
+
+        # Build attribution lookup from reflection
+        attr_lookup: dict[str, str] = {}
+        for attr in reflection.attributions:
+            attr_lookup[attr.get("skill_id", "")] = attr.get("tag", "neutral")
 
         if self.enable_differential_eval and skill_ids:
             bare_score = self._evaluate_without_skills(task)
             result["bare_score"] = bare_score
             result["differential"] = score - bare_score
-            effective_score = score - bare_score
+            delta = score - bare_score
             logger.info(
                 "[Step %d] DIFFERENTIAL: with_skills=%.3f, without=%.3f, delta=%.3f",
-                self._step_count, score, bare_score, score - bare_score,
+                self._step_count, score, bare_score, delta,
             )
 
-            # Update eval_scores and score_matrix on used skills
+            # Update eval_scores and score_matrix with attribution-refined delta
             for sid in skill_ids:
                 skill = self.library.get(sid)
                 if skill:
                     skill.eval_scores.append(score)
-                    skill.score_matrix[task_key] = effective_score
+                    tag = attr_lookup.get(sid, "neutral")
+                    if tag == "helpful":
+                        attributed = delta
+                    elif tag == "harmful":
+                        attributed = min(delta, -EPSILON)
+                    else:
+                        attributed = 0.0
+                    skill.score_matrix[task_key] = {
+                        "delta": delta,
+                        "attributed": attributed,
+                        "co_skills": [s for s in skill_ids if s != sid],
+                        "solo": solo,
+                    }
         else:
-            # Still record scores even without differential
+            # Without differential, record raw score
             for sid in skill_ids:
                 skill = self.library.get(sid)
                 if skill:
                     skill.eval_scores.append(score)
-                    skill.score_matrix[task_key] = score
+                    skill.score_matrix[task_key] = {
+                        "delta": score,
+                        "attributed": score,
+                        "co_skills": [s for s in skill_ids if s != sid],
+                        "solo": solo,
+                    }
 
         # Step 6: INDEX UPDATE (EMA)
         for sid in skill_ids:
