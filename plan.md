@@ -44,7 +44,9 @@ The objective is to maximize cumulative task performance over the sequence:
 
 subject to the constraint that model weights θ remain frozen and the only adaptable component is the skill library L.
 
-### 1.4 Core Problem: Why Skills, Not Prompts?
+### 1.4 Core Problems
+
+#### 1.4.1 Why Skills, Not Prompts?
 
 Existing approaches to context adaptation optimize either **monolithic prompts** (rewritten wholesale at each mutation) or **flat memory lists** (bullets appended and pruned over time). These representations face fundamental limitations:
 
@@ -54,14 +56,27 @@ Existing approaches to context adaptation optimize either **monolithic prompts**
 
 **Problem 3 — Catastrophic forgetting under rewrite.** When an LLM rewrites accumulated context, it tends to compress or drop previously accumulated knowledge — a phenomenon known as "context collapse." Append-only strategies avoid this but lead to bloated, unfocused context over time.
 
-**Problem 4 — Skill injection attacks.** As skill-based systems become prevalent, they introduce a novel **supply chain security threat**: malicious instructions can be embedded within otherwise legitimate skill content. Unlike traditional prompt injection (adversarial text in data), skill injection is an *instruction-instruction conflict* — bad instructions hidden among good ones — making data-instruction separation defenses inapplicable. Furthermore, many instructions are **dual-use**: the same action (e.g., "backup files to external server") can be legitimate in one context but constitute data exfiltration in another. This contextual security challenge cannot be solved by model scaling alone; it depends fundamentally on what information the agent accesses and the semantic context of the task.
+The emerging consensus confirms this direction: recent surveys characterize skill engineering as a paradigm shift beyond prompt engineering and atomic tool use (Wu et al., 2026; Jiang et al., 2026), where skills are composable packages of instructions, workflows, and metadata that agents load on demand.
+
+#### 1.4.2 Why PRISM, Not Existing Skill Systems?
+
+A wave of concurrent work has begun exploring skill-based architectures for LLM agents. We identify several key approaches and the gaps PRISM addresses:
+
+**SkillRL** (Li et al., 2026) distills raw trajectories into a hierarchical skill library (SkillBank) and co-evolves skills with the agent's policy via reinforcement learning. **SAGE** (Yang et al., 2025) similarly incorporates skill libraries into an RL training loop (GRPO), using sequential rollout across task chains. Both systems **require weight updates** — the skill library and the agent's policy are jointly trained. PRISM operates with **frozen model weights**, making it applicable to black-box API models and requiring no training infrastructure.
+
+**AutoSkill** (Wang et al., 2026) is closest in spirit to PRISM: it extracts reusable skills from interaction traces without retraining, supports a skill lifecycle (creation, evolution, injection), and positions itself as a model-agnostic plug-in. However, AutoSkill lacks (1) **per-instance performance tracking** — it does not maintain score matrices or Pareto-based evaluation, relying instead on heuristic quality signals; (2) **principled lifecycle decisions** — skill evolution is driven by LLM judgment alone, without ε-domination or leave-one-out verification; and (3) **credit attribution** — when multiple skills are co-selected, there is no mechanism to disentangle individual contributions.
+
+**MACLA** (Forouzandeh et al., 2025) maintains hierarchical procedural memory with Bayesian reliability tracking and contrastive refinement. While it shares PRISM's goal of frozen-weight adaptation with principled evaluation, it operates at the **procedure level** (step-by-step action sequences) rather than the **strategy level** (reusable problem-solving knowledge). MACLA's procedures are tightly coupled to specific action spaces (ALFWorld, WebShop), whereas PRISM's skills are domain-agnostic knowledge documents.
+
+**Problem 4 — Unaddressed security in skill systems.** As skill-based systems become prevalent, they introduce a novel **supply chain security threat**: malicious instructions can be embedded within otherwise legitimate skill content. Unlike traditional prompt injection (adversarial text in data), skill injection is an *instruction-instruction conflict* — bad instructions hidden among good ones — making data-instruction separation defenses inapplicable. Furthermore, many instructions are **dual-use**: the same action (e.g., "backup files to external server") can be legitimate in one context but constitute data exfiltration in another. Recent surveys identify this as a critical open problem (Wu et al., 2026), yet none of the above systems incorporate security mechanisms into their skill lifecycle. PRISM's continuous curation provides **defense-in-depth**: harmful content is detected through performance degradation and removed via RETIRE, isolated via SPECIALIZE, or corrected via REFINE.
 
 **PRISM's answer:** Decompose knowledge into **independent, persistent skill units** that:
 - Are created, evaluated, and retired independently (no interference)
 - Can be selected in arbitrary combinations per task (compositional reuse)
 - Accumulate content via ENRICH (append-only) and are rewritten only under quality-controlled REFINE (no collapse)
-- Track per-instance performance via a score matrix, enabling Pareto-based lifecycle decisions
-- Are **self-generated and continuously curated**, providing inherent robustness to skill injection: harmful content is detected through performance degradation and removed via RETIRE, isolated via SPECIALIZE, or corrected via REFINE
+- Track per-instance performance via a score matrix, enabling **Pareto-based lifecycle decisions** — unlike heuristic-driven evolution in AutoSkill or RL-coupled evolution in SkillRL/SAGE
+- Solve the **set-vs-skill credit attribution problem** through attribution-refined deltas and targeted leave-one-out verification — a challenge unaddressed by any existing skill system
+- Are **self-generated and continuously curated**, providing inherent robustness to skill injection
 
 ### 1.5 The Score Matrix and Pareto-Based Lifecycle
 
@@ -93,7 +108,7 @@ This creates a dual feedback loop: task outcomes drive lifecycle decisions (reti
 
 ### 1.7 The PRISM Loop
 
-Putting it all together, PRISM implements a 6-step loop per task:
+Putting it all together, PRISM implements a 5-step loop per task:
 
 ```
 For each task tᵢ:
@@ -118,8 +133,7 @@ For each task tᵢ:
   ⑤ DIFFERENTIAL Compute δ = μ_new − μ_ref against operation-specific baseline (§3.5)
                  → attribute δ per skill: record (δ, δ̂, co-selected set, solo flag)
                  → for lifecycle operations, verify on replay buffer and accept or roll back
-
-  ⑥ INDEX       Update EMA scores for future retrieval ranking
+                 → update EMA index for future retrieval ranking (Layer 3 of §3.1)
 ```
 
 The library L persists across tasks and epochs, with each skill independently accumulating performance data, undergoing quality assessment, and evolving through lifecycle operations. The score matrix stores attribution-refined entries that mitigate the set-vs-skill credit problem (§2.1), and high-stakes lifecycle decisions are confirmed by targeted leave-one-out verification (§3.5). Over time, the library converges toward a set of high-quality, non-redundant, specialized skills that collectively cover the task distribution.
@@ -138,31 +152,17 @@ The library L persists across tasks and epochs, with each skill independently ac
 
 ---
 
-## 2. Soft Pareto Dominance for Skill Evaluation
+## 2. Skill Evaluation
 
-The core mechanism underlying PRISM's lifecycle decisions is a Pareto-guided skill evaluation system that operates across three levels: per-instance score tracking, skill-level Pareto frequency, and soft ε-domination. This section defines these data structures and the domination relations that drive skill retirement, specialization, and retrieval boosting.
+### 2.1 The Set-vs-Skill Attribution Problem
 
-### 2.1 The Skill Score Matrix
-
-Each skill $\sigma$ maintains a sparse score matrix $S[\sigma]$: a mapping from task instance keys to attribution-refined score entries.
-
-$$S[\sigma]: h(t_i) \rightarrow (\delta_i,\ \hat{\delta}_i,\ C_i,\ \text{solo}_i)$$
-
-where $h(t_i)$ is an 8-character MD5 hash of the task question text and:
-- $\delta_i$: the raw set-level **differential score** — the paired difference between the new version and a reference baseline on instance $i$
-- $\hat{\delta}_i$: the **attribution-refined delta**, computed from the Reflector's per-skill causal judgment (see below)
-- $C_i \subseteq \mathcal{L}$: the set of co-selected skills on this instance
-- $\text{solo}_i \in \{\text{true}, \text{false}\}$: whether $\sigma$ was the only skill selected
-
-The raw differential score is defined as:
+A naive way to evaluate the skill is through differential score which is defined as:
 
 $$\delta_i = \mu_{\text{new}}(i) - \mu_{\text{ref}}(i)$$
 
-The reference baseline varies by lifecycle operation — for routine evaluation it is the base prompt without skills, for REFINE/ENRICH it is the pre-modification skill, for SPECIALIZE it is the parent skill, and so on (see §3.5 for the full framework). In all cases, the differential isolates the marginal contribution of a change relative to what was there before. When differential evaluation is disabled, the raw score is recorded directly.
+where the reference baseline runs without the selected skills or without the updates on selected skills.
 
-#### The Set-vs-Skill Attribution Problem
-
-The raw differential score $\delta_i$ measures the contribution of the **entire selected skill set** $S_i$, not any individual skill. Yet the score matrix records this set-level signal on each skill independently. When the Assembler selects skills $\{A, B, C\}$ for a task and the differential $\delta = +0.3$, all three skills receive $\delta = +0.3$ in their score matrices. This creates three problems:
+However, the raw differential score $\delta_i$ measures the contribution of the **entire selected skill set** $S_i$, not any individual skill. Yet the score matrix records this set-level signal on each skill independently. When the Assembler selects skills $\{A, B, C\}$ for a task and the differential $\delta = +0.3$, all three skills receive $\delta = +0.3$ in their score matrices. This creates three problems:
 
 1. **Credit misattribution.** Skill $A$ might be the sole contributor ($+0.3$), while $B$ and $C$ are neutral or even slightly harmful — but masked by $A$'s contribution. All three receive undeserved credit.
 
@@ -170,15 +170,97 @@ The raw differential score $\delta_i$ measures the contribution of the **entire 
 
 3. **Inconsistent lifecycle signals.** A skill's harmful ratio (from Reflector attributions) may conflict with its score matrix entries. The Reflector says "$B$ was harmful" but the score matrix says $B$ scored $+0.3$ because $A$ compensated. The two signals diverge precisely when they should agree.
 
-#### Attribution-Refined Delta
+### 2.2 Attribution-Gated Scoring with Targeted Leave-One-Out
 
-The attribution-refined delta $\hat{\delta}$ addresses the set-vs-skill problem by partitioning the set-level signal using the Reflector's per-skill attribution:
+The core mechanism underlying PRISM's lifecycle decisions is a Pareto-guided skill evaluation system that operates across three levels: per-instance score tracking, skill-level Pareto frequency, and soft ε-domination. This section defines these data structures and the domination relations that drive skill retirement, specialization, and retrieval boosting.
+
+Each skill $\sigma$ maintains a sparse score matrix $S[\sigma]$: a mapping from task instance keys to attribution-refined score entries.
+
+$$S[\sigma]: h(t_i) \rightarrow (\hat{\delta}_i,\ C_i,\ \text{solo}_i)$$
+
+where $h(t_i)$ is an 8-character MD5 hash of the task question text and:
+- $\hat{\delta}_i$: the **attribution-refined delta**, computed from the Reflector's per-skill causal judgment (see below)
+- $C_i \subseteq \mathcal{L}$: the set of co-selected skills on this instance
+- $\text{solo}_i \in \{\text{true}, \text{false}\}$: whether $\sigma$ was the only skill selected
+
+As discussed in §2.1, the differential $\delta(j)$ is a set-level signal shared by all co-selected skills. The score matrix addresses this through a two-tier approach:
+
+**Tier 1 — Attribution-refined scoring (routine).** On every task, each skill receives an attributed delta $\hat{\delta}(\sigma, j)$ that respects the Reflector's causal judgment: helpful skills inherit $\delta$, neutral skills receive 0, and harmful skills receive $\min(\delta, -\varepsilon)$. The co-selection context $C_j$ and solo flag are recorded alongside (see §2.1). This is cheap — no extra evaluations — and provides a reasonable per-skill signal for routine Pareto updates.
+
+
+<!-- The attribution-refined delta $\hat{\delta}$ addresses the set-vs-skill problem by partitioning the set-level signal using the Reflector's per-skill attribution:
 
 $$\hat{\delta}(\sigma, j) = \begin{cases} \delta(j) & \text{if attribution}(\sigma, j) = \texttt{helpful} \\ 0 & \text{if attribution}(\sigma, j) = \texttt{neutral} \\ \min(\delta(j),\ -\varepsilon) & \text{if attribution}(\sigma, j) = \texttt{harmful} \end{cases}$$
 
-This ensures that a skill judged harmful by the Reflector never receives a positive score, even when the overall skill set performed well. When $\text{solo} = \text{true}$, the raw $\delta$ and attributed $\hat{\delta}$ coincide (no co-selection ambiguity), making solo entries the cleanest signal in the matrix.
+This ensures that a skill judged harmful by the Reflector never receives a positive score, even when the overall skill set performed well. When $\text{solo} = \text{true}$, the raw $\delta$ and attributed $\hat{\delta}$ coincide (no co-selection ambiguity), making solo entries the cleanest signal in the matrix. -->
 
-#### Pareto Computation with Mixed Signals
+
+**Tier 2 — Leave-one-out verification (at lifecycle decision points).** Before committing to a high-stakes lifecycle operation (BIRTH OR RETIRE or SPECIALIZE), the system runs **targeted leave-one-out (LOO) evaluations** on the skill's replay buffer to obtain causal per-skill deltas:
+
+$$\delta_{\text{LOO}}(\sigma, j) = \mu(S_j, j) - \mu(S_j \setminus \{\sigma\}, j)$$
+
+where $S_j$ is the skill set used on instance $j$. This isolates $\sigma$'s marginal causal contribution by comparing performance with and without it while holding all other skills fixed. LOO verification runs on the replay buffer instances (at most $n_{\text{verify}}$ evaluations per skill), so cost is bounded and incurred only when a lifecycle decision is imminent.
+
+The BIRTH decision requires LOO confirmation: too many skills will pollute context and confuse the agent.
+The RETIRE decision requires LOO confirmation: a skill is only retired if it remains $\varepsilon$-dominated when its score matrix entries are replaced with $\delta_{\text{LOO}}$ values from the replay buffer. Similarly, SPECIALIZE checks whether the skill's inconsistency (high Pareto frequency + high harmful ratio) persists under LOO scores before splitting. This prevents acting on spurious credit or blame caused by co-selection effects.
+
+<!-- 
+### 2.1 Differential Evaluation for inter-skills lifecycle decisions.
+
+Every lifecycle operation produces a skill that must be verified against a **reference baseline** on the same task instances. The framework is uniform: run the task with the new version and with the reference version, compute a paired difference, and accept or roll back based on the aggregate signal. What differs across operations is only the reference:
+
+| Operation | New version | Reference baseline |
+|---|---|---|
+| **BIRTH** | Prompt with new skill included | Prompt without the new skill (base prompt $\pi_0$ or prompt with remaining skills) |
+| **REFINE / ENRICH** | Prompt with modified skill | Prompt with old (pre-modification) skill |
+| **SPECIALIZE** | Prompt with child skill | Prompt with parent skill |
+| **GENERALIZE** | Prompt with merged skill | Prompt with the better-scoring original parent |
+
+For BIRTH, a positive $\delta$ means the new skill adds value beyond the baseline. For modification operations, a positive $\delta$ means the change improved upon the previous version. In all cases, the system caches the reference version (old skill content or absence of skill) until verification completes.
+
+The acceptance criterion is: $\text{mean}(\delta) \geq -\varepsilon$ across verified instances. If the criterion fails, the operation is **rolled back** — the old skill (or no skill, for BIRTH) is restored. -->
+
+
+
+### 2.3 Pareto Frequency and Soft $\varepsilon$-Domination
+
+After each curation step, the system computes per-skill **Pareto frequency** — the fraction of evaluated instances on which a skill is non-dominated.
+
+For each task instance key $j$ present in any active skill's score matrix, the best observed score is:
+
+$$s^*(j) = \max_{\sigma \in \mathcal{L}_{\text{active}}} \hat{\delta}(\sigma, j)$$
+
+where $\hat{\delta}(\sigma, j)$ is the attribution-refined delta from §2.1. A skill $\sigma$ is **non-dominated on instance $j$** if its score is within $\varepsilon$ of the best:
+
+$$\hat{\delta}(\sigma, j) \geq s^*(j) - \varepsilon$$
+
+where $\varepsilon = 0.05$ is a soft tolerance threshold. The Pareto frequency of skill $\sigma$ is then:
+
+$$f(\sigma) = \frac{|\{j \mid \sigma \text{ is non-dominated on } j\}|}{|\{j \mid j \in S[\sigma]\}|}$$
+
+This scalar $f(\sigma)$ serves as the primary signal for three downstream decisions: skill selection (§3.1), skill retirement, and skill specialization (§3.4).
+
+To make lifecycle decisions, we define a conservative domination relation. Skill $\sigma_a$ **$\varepsilon$-dominates** skill $\sigma_b$ if and only if:
+
+1. They share at least $n_{\min} = 3$ evaluated instances: $|K_a \cap K_b| \geq n_{\min}$, where $K_\sigma = \text{keys}(S[\sigma])$
+2. On every shared instance, $\sigma_a$ scores at least as well (within tolerance): $\forall j \in K_a \cap K_b: \hat{\delta}(\sigma_a, j) \geq \hat{\delta}(\sigma_b, j) - \varepsilon$
+3. On at least one shared instance, $\sigma_a$ is strictly better: $\exists j \in K_a \cap K_b: \hat{\delta}(\sigma_a, j) > \hat{\delta}(\sigma_b, j)$
+4. The skills are semantically similar (competing for the same niche): $\text{sim}(\sigma_a, \sigma_b) \geq \theta_{\text{sim}}$, where $\text{sim}(A, B) = \cos(\text{emb}(A.\text{description}), \text{emb}(B.\text{description}))$ and $\theta_{\text{sim}} = 0.5$
+
+**Why conditions 1-3?** Condition 1 prevents premature retirement when two skills have insufficient comparison data. The $\varepsilon$ tolerance in condition 2 avoids retiring a skill that is only marginally worse on some instances — it must be consistently dominated, not just occasionally slightly behind.
+
+**Why condition 4 (semantic similarity)?** Domination comparisons only make sense between skills that compete for the same niche. A geometry skill shouldn't be retired because an algebra skill "dominates" it on algebra tasks — they serve different purposes. If $\text{sim}(A, B) < \theta_{\text{sim}}$, the skills target different task types and neither can dominate the other regardless of scores. This prevents semantically inappropriate retirements (apples vs oranges).
+
+**The correlation-causation problem.** Conditions 1-3 can still be too aggressive because the score matrix records **correlation, not causation**. When skills A and B are frequently co-selected for the same tasks, they receive identical differential scores on those instances — both get credit when the task succeeds, both get blamed when it fails. Skill A may appear to ε-dominate skill B simply because they were always selected together and A happened to also be selected on a few additional successful instances. But B may have **independent causal contribution** that we never observe because B was never tested in isolation.
+
+Consider the example: an "algebra_tricks" skill and a "geometry_basics" skill are co-selected on instances 1-5 (mixed problem sets), both scoring [+0.3, +0.2, +0.4, +0.1, +0.3]. The algebra skill is additionally selected alone on instances 6-7 (pure algebra problems), scoring [+0.2, +0.1]. By conditions 1-3 alone, algebra_tricks would "dominate" geometry_basics. But this is doubly spurious: (1) the skills serve different purposes — $\text{sim}(\text{algebra}, \text{geometry}) < \theta_{\text{sim}}$ — so condition 4 fails and dominance check should not apply; (2) even if they were similar, we have no evidence that algebra alone caused the shared successes on instances 1-5. Geometry might be equally effective on geometry-related aspects of those problems; we simply never tested geometry without algebra.
+
+PRISM mitigates the correlation-causation problem through three layers: (1) attribution-refined deltas $\hat{\delta}$ replace raw set-level scores, preventing harmful skills from inheriting credit (§2.1); (2) condition 4 blocks cross-niche domination; and (3) targeted leave-one-out verification at lifecycle decision points provides causal confirmation before committing to RETIRE or SPECIALIZE (§3.5).
+
+A skill is **Pareto-optimal** if no other active skill $\varepsilon$-dominates it. The set of Pareto-optimal skills forms the **Pareto front** of the library.
+
+
+### 2.4 Pareto Computation with Mixed Signals
 
 All downstream Pareto computations (§2.2, §2.3) use the attributed delta $\hat{\delta}$ rather than the raw $\delta$, with a preference for solo entries:
 
@@ -204,50 +286,11 @@ From this matrix we can compute:
 - **Pareto frequency of algebra_tricks**: On inst 1 (solo), it scores +0.3 vs number_theory's +0.1 (co-selected) → non-dominated. On inst 3, +0.1 vs geometry's 0.0 → non-dominated. On inst 4 (solo), +0.4 vs number_theory's −0.2 (solo) → non-dominated. Pareto frequency = 3/3 = 1.0.
 - **$\varepsilon$-domination check**: Does algebra_tricks dominate number_theory? Shared instances: {inst 1, inst 4} (inst 3 missing for number_theory). Attributed scores: $A = [+0.3, +0.4]$ vs $N = [+0.1, -0.2]$. $A \geq N$ on all shared instances and $A > N$ on at least one → algebra_tricks $\varepsilon$-dominates number_theory (pending $\geq 3$ shared instances). Note: inst 1's comparison is high-confidence (algebra is solo) while number_theory's +0.1 is co-selected (lower confidence).
 
-### 2.2 Pareto Frequency
-
-After each curation step, the system computes per-skill **Pareto frequency** — the fraction of evaluated instances on which a skill is non-dominated.
-
-For each task instance key $j$ present in any active skill's score matrix, the best observed score is:
-
-$$s^*(j) = \max_{\sigma \in \mathcal{L}_{\text{active}}} \hat{\delta}(\sigma, j)$$
-
-where $\hat{\delta}(\sigma, j)$ is the attribution-refined delta from §2.1. A skill $\sigma$ is **non-dominated on instance $j$** if its score is within $\varepsilon$ of the best:
-
-$$\hat{\delta}(\sigma, j) \geq s^*(j) - \varepsilon$$
-
-where $\varepsilon = 0.05$ is a soft tolerance threshold. The Pareto frequency of skill $\sigma$ is then:
-
-$$f(\sigma) = \frac{|\{j \mid \sigma \text{ is non-dominated on } j\}|}{|\{j \mid j \in S[\sigma]\}|}$$
-
-This scalar $f(\sigma)$ serves as the primary signal for three downstream decisions: skill selection (§3.1), skill retirement, and skill specialization (§3.4).
-
-### 2.3 Soft $\varepsilon$-Domination
-
-To make lifecycle decisions, we define a conservative domination relation. Skill $\sigma_a$ **$\varepsilon$-dominates** skill $\sigma_b$ if and only if:
-
-1. They share at least $n_{\min} = 3$ evaluated instances: $|K_a \cap K_b| \geq n_{\min}$, where $K_\sigma = \text{keys}(S[\sigma])$
-2. On every shared instance, $\sigma_a$ scores at least as well (within tolerance): $\forall j \in K_a \cap K_b: \hat{\delta}(\sigma_a, j) \geq \hat{\delta}(\sigma_b, j) - \varepsilon$
-3. On at least one shared instance, $\sigma_a$ is strictly better: $\exists j \in K_a \cap K_b: \hat{\delta}(\sigma_a, j) > \hat{\delta}(\sigma_b, j)$
-4. The skills are semantically similar (competing for the same niche): $\text{sim}(\sigma_a, \sigma_b) \geq \theta_{\text{sim}}$, where $\text{sim}(A, B) = \cos(\text{emb}(A.\text{description}), \text{emb}(B.\text{description}))$ and $\theta_{\text{sim}} = 0.5$
-
-**Why conditions 1-3?** Condition 1 prevents premature retirement when two skills have insufficient comparison data. The $\varepsilon$ tolerance in condition 2 avoids retiring a skill that is only marginally worse on some instances — it must be consistently dominated, not just occasionally slightly behind.
-
-**Why condition 4 (semantic similarity)?** Domination comparisons only make sense between skills that compete for the same niche. A geometry skill shouldn't be retired because an algebra skill "dominates" it on algebra tasks — they serve different purposes. If $\text{sim}(A, B) < \theta_{\text{sim}}$, the skills target different task types and neither can dominate the other regardless of scores. This prevents semantically inappropriate retirements (apples vs oranges).
-
-**The correlation-causation problem.** Conditions 1-3 can still be too aggressive because the score matrix records **correlation, not causation**. When skills A and B are frequently co-selected for the same tasks, they receive identical differential scores on those instances — both get credit when the task succeeds, both get blamed when it fails. Skill A may appear to ε-dominate skill B simply because they were always selected together and A happened to also be selected on a few additional successful instances. But B may have **independent causal contribution** that we never observe because B was never tested in isolation.
-
-Consider the example: an "algebra_tricks" skill and a "geometry_basics" skill are co-selected on instances 1-5 (mixed problem sets), both scoring [+0.3, +0.2, +0.4, +0.1, +0.3]. The algebra skill is additionally selected alone on instances 6-7 (pure algebra problems), scoring [+0.2, +0.1]. By conditions 1-3 alone, algebra_tricks would "dominate" geometry_basics. But this is doubly spurious: (1) the skills serve different purposes — $\text{sim}(\text{algebra}, \text{geometry}) < \theta_{\text{sim}}$ — so condition 4 fails and dominance check should not apply; (2) even if they were similar, we have no evidence that algebra alone caused the shared successes on instances 1-5. Geometry might be equally effective on geometry-related aspects of those problems; we simply never tested geometry without algebra.
-
-PRISM mitigates the correlation-causation problem through three layers: (1) attribution-refined deltas $\hat{\delta}$ replace raw set-level scores, preventing harmful skills from inheriting credit (§2.1); (2) condition 4 blocks cross-niche domination; and (3) targeted leave-one-out verification at lifecycle decision points provides causal confirmation before committing to RETIRE or SPECIALIZE (§3.5).
-
-A skill is **Pareto-optimal** if no other active skill $\varepsilon$-dominates it. The set of Pareto-optimal skills forms the **Pareto front** of the library.
-
 ---
 
 ## 3. The PRISM Loop
 
-PRISM runs a six-step loop per task instance: **Retrieve → Execute → Reflect → Curate → Differential Evaluate → Index**. The system maintains a persistent skill library $\mathcal{L}$ where each skill independently accumulates performance data, undergoes lifecycle operations, and evolves over time.
+PRISM runs a five-step loop per task instance: **Retrieve → Execute → Reflect → Curate → Differential Evaluate → Index**. The system maintains a persistent skill library $\mathcal{L}$ where each skill independently accumulates performance data, undergoes lifecycle operations, and evolves over time.
 
 ### 3.1 Multi-Layer Skill Retrieval
 
@@ -259,7 +302,7 @@ At inference time, the Assembler selects a subset of skills for a new task insta
 
 $$\text{sim}(\sigma, x) = \cos(\text{emb}(\sigma.\text{description}),\ \text{emb}(x))$$
 
-**Layer 3 — EMA index lookup.** A task type index maintains exponential moving average (EMA) scores per skill per task type. For the classified task type, the index returns the top-scoring skills. The final base score is the maximum of Layer 2 and Layer 3:
+**Layer 3 — EMA index lookup.** A task type index maintains exponential moving average (EMA) scores per skill per task type. After each task evaluation (step ⑤), the EMA index is updated for each skill on the current task type, smoothing noisy per-instance scores into a stable ranking per task category. At retrieval time, the index returns the top-scoring skills for the classified task type. The final base score is the maximum of Layer 2 and Layer 3:
 
 $$\text{base}(\sigma) = \max(\text{sim}(\sigma, x),\ \text{ema}(\sigma, \text{type}(x)))$$
 
@@ -320,7 +363,7 @@ Retired skills are marked with `status = "retired"` and excluded from future ret
 New skills are created when the Reflector identifies knowledge gaps — areas where the current skill library lacks relevant strategies. Two sources of gap signals are combined:
 
 - **Reflector gaps:** The Reflector analyzes execution traces and diagnoses specific missing knowledge (e.g., "no strategy for modular arithmetic with large primes").
-- **Coverage gaps:** The system scans all task instance keys across active skills and identifies instances where the best score falls below a coverage threshold ($\theta_{\text{cov}} = 0.3$). When at least $n_{\text{gap}} = 2$ uncovered instances are found, they are surfaced as coverage gap descriptions.
+- **Coverage gaps:** The system scans all task instance keys across active skills and identifies instances where the best attributed delta among all active skills falls below a coverage threshold ($\theta_{\text{cov}} = 0.3$) — i.e., instances where every skill performed poorly. This detects "blind spots" in the library: regions of the task distribution that no existing skill covers well. For example, if the library has skills for algebra and geometry but keeps scoring below 0.3 on number theory problems, those instances surface as coverage gaps. The threshold $n_{\text{gap}} = 2$ requires at least two such uncovered instances before triggering, avoiding overreaction to a single hard outlier.
 
 Both gap sources are merged and passed to an LLM that decides whether to CREATE a new skill or ENRICH an existing one.
 
@@ -350,41 +393,7 @@ When two active skills share sufficient keyword overlap (Jaccard similarity $\ge
 
 Periodically, active skills undergo content-level quality assessment via the SkillValidator. Skills whose content has degraded (e.g., through repeated enrichment) or whose quality score falls below threshold are fully rewritten by an LLM while preserving the core strategies. This operation is triggered by the quality audit cycle rather than by task-level outcomes.
 
-### 3.5 Differential Evaluation
-
-Every lifecycle operation produces a skill that must be verified against a **reference baseline** on the same task instances. The framework is uniform: run the task with the new version and with the reference version, compute a paired difference, and accept or roll back based on the aggregate signal.
-
-$$\delta(j) = \mu_{\text{new}}(j) - \mu_{\text{ref}}(j)$$
-
-What differs across operations is only the reference:
-
-| Operation | New version | Reference baseline |
-|---|---|---|
-| **BIRTH** | Prompt with new skill included | Prompt without the new skill (base prompt $\pi_0$ or prompt with remaining skills) |
-| **REFINE / ENRICH** | Prompt with modified skill | Prompt with old (pre-modification) skill |
-| **SPECIALIZE** | Prompt with child skill | Prompt with parent skill |
-| **GENERALIZE** | Prompt with merged skill | Prompt with the better-scoring original parent |
-
-For BIRTH, a positive $\delta$ means the new skill adds value beyond the baseline. For modification operations, a positive $\delta$ means the change improved upon the previous version. In all cases, the system caches the reference version (old skill content or absence of skill) until verification completes.
-
-The acceptance criterion is: $\text{mean}(\delta) \geq -\varepsilon$ across verified instances. If the criterion fails, the operation is **rolled back** — the old skill (or no skill, for BIRTH) is restored.
-
-#### Attribution-Gated Scoring with Targeted Leave-One-Out
-
-As discussed in §2.1, the differential $\delta(j)$ is a set-level signal shared by all co-selected skills. The score matrix addresses this through a two-tier approach:
-
-**Tier 1 — Attribution-refined scoring (routine).** On every task, the set-level $\delta(j)$ is partitioned across co-selected skills using the Reflector's per-skill attributions (§3.3). Each skill receives an attributed delta $\hat{\delta}(\sigma, j)$ that respects the Reflector's causal judgment: helpful skills inherit $\delta$, neutral skills receive 0, and harmful skills receive $\min(\delta, -\varepsilon)$. The co-selection context $C_j$ and solo flag are recorded alongside (see §2.1). This is cheap — no extra evaluations — and provides a reasonable per-skill signal for routine Pareto updates.
-
-**Tier 2 — Leave-one-out verification (at lifecycle decision points).** Before committing to a high-stakes lifecycle operation (RETIRE or SPECIALIZE), the system runs **targeted leave-one-out (LOO) evaluations** on the skill's replay buffer to obtain causal per-skill deltas:
-
-$$\delta_{\text{LOO}}(\sigma, j) = \mu(S_j, j) - \mu(S_j \setminus \{\sigma\}, j)$$
-
-where $S_j$ is the skill set used on instance $j$. This isolates $\sigma$'s marginal causal contribution by comparing performance with and without it while holding all other skills fixed. LOO verification runs on the replay buffer instances (at most $n_{\text{verify}}$ evaluations per skill), so cost is bounded and incurred only when a lifecycle decision is imminent.
-
-The RETIRE decision requires LOO confirmation: a skill is only retired if it remains $\varepsilon$-dominated when its score matrix entries are replaced with $\delta_{\text{LOO}}$ values from the replay buffer. Similarly, SPECIALIZE checks whether the skill's inconsistency (high Pareto frequency + high harmful ratio) persists under LOO scores before splitting. This prevents acting on spurious credit or blame caused by co-selection effects.
-
-For solo entries ($|S_j| = 1$), LOO is unnecessary — the set-level $\delta$ already equals the per-skill causal contribution. The system tracks the fraction of solo entries per skill; skills with predominantly solo evaluations can skip LOO verification at lifecycle decision points.
-
+### 3.5 Differential Evaluation for lifecycle operation
 #### Offline Setting (Multi-Epoch over Fixed Dataset)
 
 Following GEPA's approach of evaluating candidates on a fixed validation set, PRISM maintains a **validation split** $D_{\text{val}}$ of the training data. After a lifecycle operation, the system re-evaluates the new version on $D_{\text{val}}$ (or a subsample of size $n_{\text{verify}} = \min(20, |D_{\text{val}}|)$) and compares per-instance scores against the reference version's scores on the same instances. Since the full dataset is available, verification is immediate — no waiting for future tasks.
@@ -401,11 +410,7 @@ The replay buffer stores only $n_{\text{verify}} = \min(5, |K_\sigma|)$ task ins
 
 For SPECIALIZE, both children enter verification simultaneously, each caching the parent as reference. For GENERALIZE, the merged skill caches the better-scoring parent. If multiple skills undergo lifecycle operations concurrently, each independently maintains its own reference cache, with total cache size bounded by the number of concurrent operations (typically 1–2 per curation step).
 
-### 3.6 EMA Index Update
-
-After evaluation, an exponential moving average (EMA) index is updated for each skill on the current task type. This index provides a fast, non-Pareto retrieval signal for Layer 3 of the Assembler, smoothing noisy per-instance scores into a stable ranking per task category.
-
-### 3.7 Handling Sparsity and Cold Start
+### 3.6 Handling Sparsity and Cold Start
 
 The score matrix is very sparse, especially early in optimization. PRISM uses three mechanisms to handle this gracefully:
 
@@ -415,9 +420,9 @@ The score matrix is very sparse, especially early in optimization. PRISM uses th
 
 3. **Adaptive exploration.** The Assembler allocates more explore slots when the library is immature (total evaluations $< n_{\text{mature}}$), accelerating score matrix population. Unevaluated skills receive a fixed exploration bonus to ensure they are selected and tested. As the library matures, exploration decreases in favor of exploitation of proven skills.
 
-### 3.8 Multi-Epoch Training
+### 3.7 Multi-Epoch Training
 
-The system supports multi-epoch training over a fixed task set. In each epoch, every task instance is processed through the full six-step loop. Across epochs:
+The system supports multi-epoch training over a fixed task set. In each epoch, every task instance is processed through the full five-step loop. Across epochs:
 
 - The score matrix accumulates more entries, making Pareto computations increasingly accurate
 - Lifecycle operations progressively retire dominated skills, specialize inconsistent ones, and birth new skills for coverage gaps
