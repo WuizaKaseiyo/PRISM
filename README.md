@@ -1,40 +1,49 @@
-# PRISM — Self-Evolving Skill Library
+# SCULPT — Skill Curation Using Lifecycle Pareto Tracking
 
-A persistent, self-evolving skill library for LLM systems.
+A persistent, self-curating skill library for LLM systems with principled evaluation and lifecycle management.
 
-**Core idea**: Every time an LLM solves a task, PRISM reflects on what worked, what didn't, and what knowledge was missing — then automatically creates, refines, splits, merges, or retires reusable "skills" that improve future performance.
+**Core idea**: Every time an LLM solves a task, SCULPT reflects on what worked, attributes credit to individual skills (even when multiple are co-selected), and automatically creates, refines, splits, merges, or retires reusable "skills" — governed by Pareto-based lifecycle decisions and content quality gates.
+
+## What Makes SCULPT Different
+
+- **Credit attribution**: Solves the set-vs-skill problem — when multiple skills are selected together, attribution-refined scoring (Tier 1) and targeted leave-one-out verification (Tier 2) isolate each skill's causal contribution
+- **Pareto-based lifecycle**: Skills are retired via soft ε-domination over per-instance score vectors, not heuristic thresholds — the library converges to a non-redundant Pareto front
+- **Dual feedback loop**: Outcome signals (score matrix) drive composition-changing decisions; content quality signals (SkillValidator) drive content improvement — neither alone suffices
+- **Frozen weights**: No training required — works with any black-box LLM API
 
 ## How It Works
 
-Each task goes through a 6-step loop:
+Each task goes through a 5-step loop:
 
 ```
-task ──→ ① RETRIEVE   4-layer skill retrieval (filter → embedding → EMA → LLM)
-         ② EXECUTE    Run augmented prompt through evaluate_fn
-         ③ REFLECT    LLM analyzes: which skills helped? what's missing?
-         ④ CURATE     5 lifecycle operations (see below)
-         ⑤ DIFFERENTIAL  Compare score with vs without skills
-         ⑥ INDEX      Update EMA scores for future retrieval
+task ──→ ① RETRIEVE    5-step pipeline: task-type filter → semantic similarity
+                        → Pareto boost → exploration bonus → pool-based selection
+         ② EXECUTE     Run augmented prompt π₀ ⊕ Sᵢ on task instance
+         ③ REFLECT     Per-skill attributions (helpful/neutral/harmful) + gap diagnoses
+         ④ CURATE      6 lifecycle operations (see below)
+         ⑤ EVALUATE    Differential eval: δ = μ_new − μ_ref → update score matrix
 ```
 
 ### 6 Skill Lifecycle Operations
 
-| Operation | Trigger | What Happens |
-|-----------|---------|-------------|
-| **BIRTH** | Coverage gap: best score < 0.3 on ≥2 instances | LLM creates a new skill |
-| **ENRICH** | Gap matches existing skill | Append strategy content (8k char budget) |
-| **SPECIALIZE** | Pareto freq ≥ 0.4 AND harmful ratio ≥ 0.25 (5+ evals) | LLM splits into 2 focused children |
-| **GENERALIZE** | Two skills share ≥60% keyword overlap (Jaccard) | Merge into one combined skill |
-| **RETIRE** | ε-dominated by another skill (ε=0.05, ≥3 shared instances) | Deactivate the skill |
-| **REFINE** | Quality audit (periodic) | Full content rewrite preserving core strategies |
+| Operation | Trigger | What Happens | Verified? |
+|-----------|---------|-------------|-----------|
+| **NO-OP** | All skills helpful/neutral, no gaps | Skip curation | — |
+| **BIRTH** | Coverage gap: best score < 0.3 on ≥2 instances | LLM creates a new skill | LOO ✓ |
+| **ENRICH** | Gap matches existing skill, or quality audit | Append (α > 0) or full rewrite (α ≈ 0) | — |
+| **SPECIALIZE** | Pareto freq ≥ 0.4 AND harmful ratio ≥ 0.25 (5+ evals) | LLM splits into 2 focused children | LOO ✓ |
+| **GENERALIZE** | Two skills share ≥60% keyword overlap (Jaccard) | Merge into one combined skill | LOO ✓ |
+| **RETIRE** | ε-dominated by another skill (ε=0.05, ≥3 shared instances) | Deactivate the skill | LOO ✓ |
+
+Composition-changing operations (BIRTH, RETIRE, SPECIALIZE, GENERALIZE) require targeted leave-one-out verification before committing.
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-conda create -n prism python=3.10 -y
-conda activate prism
+conda create -n sculpt python=3.10 -y
+conda activate sculpt
 pip install -e .
 pip install openai   # for OpenRouter
 ```
@@ -123,18 +132,18 @@ result = engine.step({"question": "..."}, module_tag="general")
 prism/
 ├── prism/
 │   ├── __init__.py              # Exports: PRISMEngine, SkillLibrary, Skill
-│   ├── engine.py                # 6-step loop + training orchestrator
+│   ├── engine.py                # 5-step loop + training orchestrator
 │   ├── utils.py                 # Shared JSON extraction (3-strategy fallback)
 │   ├── skill_library/
-│   │   ├── skill.py             # Skill dataclass + Claude Code SKILL.md serialization
+│   │   ├── skill.py             # Skill dataclass + SKILL.md serialization
 │   │   └── library.py           # Directory-per-skill storage + _meta.json persistence
 │   ├── task_index/
-│   │   └── index.py             # task_type → skill_id → EMA score
+│   │   └── index.py             # task_type → skill_id → score matrix
 │   ├── assembler/
-│   │   └── assembler.py         # 4-layer retrieval (filter→cosine→EMA→LLM)
+│   │   └── assembler.py         # 5-step retrieval (filter→cosine→Pareto boost→explore→select)
 │   └── lifecycle/
 │       ├── reflector.py         # LLM-based trace analysis → attributions + gaps
-│       └── curator.py           # 6 operations: BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE/REFINE
+│       └── curator.py           # 6 operations: NO-OP/BIRTH/ENRICH/SPECIALIZE/GENERALIZE/RETIRE
 ├── evaluate/
 │   ├── aime2025/                # AIME 2025 benchmark (30 competition math problems)
 │   └── hotpot_qa/               # HotpotQA benchmark (multi-hop QA, F1 scoring)
@@ -144,7 +153,7 @@ prism/
 └── .env                         # OPENROUTER_API_KEY, MODEL, BASE_URL
 ```
 
-### Skill Storage (Claude Code format)
+### Skill Storage
 
 ```
 data/skills/
@@ -152,7 +161,7 @@ data/skills/
 │   └── SKILL.md                 # name + description frontmatter, rich markdown body
 ├── exact-format-matching/
 │   └── SKILL.md
-└── _meta.json                   # All PRISM tracking data keyed by skill_id
+└── _meta.json                   # All SCULPT tracking data keyed by skill_id
 ```
 
 ### Dependency Layers
@@ -160,9 +169,9 @@ data/skills/
 ```
 L0  Skill, utils                  ← zero dependencies
 L1  SkillLibrary, TaskTypeIndex   ← uses L0
-L2  SkillAssembler, PRISMReflector ← uses L0-L1
+L2  SkillAssembler, Reflector     ← uses L0-L1
 L3  SkillCurator                  ← uses L0-L2
-L4  PRISMEngine                   ← uses L0-L3
+L4  SCULPTEngine                  ← uses L0-L3
 ```
 
 ## Key Interfaces
@@ -193,7 +202,7 @@ def llm_fn(prompt: str) -> str:
 
 ```python
 def embed_fn(text: str) -> list[float]:
-    """Returns embedding vector. Enables Layer 2 semantic retrieval."""
+    """Returns embedding vector. Enables semantic retrieval in Step 2."""
 ```
 
 ## Tuning
@@ -220,14 +229,15 @@ Edit constants in `prism/lifecycle/curator.py` and `prism/assembler/assembler.py
 | Decision | Rationale |
 |----------|-----------|
 | Zero required dependencies | numpy/sentence-transformers optional; pure Python cosine fallback |
-| Directory-per-skill storage | Claude Code compatible SKILL.md + centralized _meta.json for tracking |
+| Directory-per-skill storage | SKILL.md + centralized _meta.json for tracking |
 | 3-strategy JSON extraction | LLM output unreliable: direct parse → code block → brace counting |
-| EMA scoring (alpha=0.3) | Remembers history while responding quickly to changes |
 | Per-instance score matrix | Enables Pareto-based lifecycle (ε-domination, coverage gaps) |
+| Attribution-refined deltas | Solves set-vs-skill credit problem without full LOO cost |
+| Two-tier evaluation | Routine scoring is free (Tier 1); LOO only for composition-changing ops (Tier 2) |
 | Differential eval is optional | Avoids doubling API cost when not needed |
-| Skills have parent/children | Tracks lineage through SPECIALIZE operations |
+| Skills have parent/children | Tracks lineage through SPECIALIZE/GENERALIZE operations |
 | Exploration bonus for new skills | Prevents cold-start dead loop for newly created skills |
-| Graceful degradation everywhere | No embed_fn → skip Layer 2. LLM parse failure → log warning, continue |
+| Graceful degradation everywhere | No embed_fn → skip semantic retrieval. LLM parse failure → log warning, continue |
 
 ## Dependencies
 
@@ -239,7 +249,7 @@ Edit constants in `prism/lifecycle/curator.py` and `prism/assembler/assembler.py
 |---------|---------|
 | `openai` | OpenRouter / OpenAI API calls |
 | `numpy` | Faster cosine similarity |
-| `sentence-transformers` | Layer 2 embedding retrieval |
+| `sentence-transformers` | Embedding-based semantic retrieval |
 | `pandas`, `pyarrow` | AIME 2025 benchmark dataset |
 | `pytest`, `ruff`, `pyright` | Development |
 
